@@ -165,8 +165,8 @@ for server in servers:
         
         # Extract path from endpoint if path is not provided
         # endpoint formats:
-        #   - "https://datap-app-p01.riksbank.se:9000/data1/minio"
-        #   - "https://atlcdpozn01p01.amd.com:21000/hadoop/data1/minio"
+        #   - "https://server.example.com:9000/data1/minio"
+        #   - "https://server.example.com:21000/hadoop/data1/minio"
         drive_path = drive.get('path', '')
         if not drive_path and 'endpoint' in drive:
             # Extract path from endpoint URL
