@@ -91,14 +91,16 @@ class Pager:
 
 # Check for summary mode and get JSON file name
 if len(sys.argv) < 2:
-    print("Usage: python print_minio_pools.py <json_file> [--summary] [--scanning] [--low-space=<percentage>] [--pager] [--failed]")
+    print("Usage: python print_minio_pools.py <json_file> [--summary] [--scanning] [--low-space=<percentage>] [--pager] [--failed] [--min-bad-disks=<number>]")
     print("Example: python print_minio_pools.py prod.json --summary")
     print("Example: python print_minio_pools.py prod.json --scanning")
     print("Example: python print_minio_pools.py prod.json --summary --low-space=10")
     print("Example: python print_minio_pools.py prod.json --pager")
     print("Example: python print_minio_pools.py prod.json --failed")
     print("Example: python print_minio_pools.py prod.json --summary --failed")
+    print("Example: python print_minio_pools.py prod.json --summary --failed --min-bad-disks=2")
     print("Note: --low-space requires --summary mode")
+    print("Note: --min-bad-disks requires --summary --failed mode")
     print("Note: --pager pauses output after each screen (press space to continue)")
     print("Note: --failed shows only failed/faulty disks (not 'ok' state)")
     print("Note: This script requires the 'tabulate' package. Install with: pip install tabulate")
@@ -123,10 +125,28 @@ for arg in sys.argv:
             print(f"{RED}Error: Invalid --low-space value. Must be a number.{RESET}")
             sys.exit(1)
 
+# Parse --min-bad-disks option
+min_bad_disks_threshold = None
+for arg in sys.argv:
+    if arg.startswith('--min-bad-disks='):
+        try:
+            min_bad_disks_threshold = int(arg.split('=')[1])
+            if min_bad_disks_threshold < 0:
+                raise ValueError("Must be non-negative")
+        except (ValueError, IndexError):
+            print(f"{RED}Error: Invalid --min-bad-disks value. Must be a non-negative integer.{RESET}")
+            sys.exit(1)
+
 # Validate that --low-space is only used with --summary
 if low_space_threshold is not None and not summary_mode:
     print(f"{RED}Error: --low-space option requires --summary mode.{RESET}")
     sys.exit(1)
+
+# Validate that --min-bad-disks is only used with --summary --failed
+if min_bad_disks_threshold is not None:
+    if not summary_mode or not failed_mode:
+        print(f"{RED}Error: --min-bad-disks option requires --summary --failed mode.{RESET}")
+        sys.exit(1)
 
 # Load the JSON data
 try:
@@ -703,6 +723,11 @@ for pool_idx, sets in pools.items():
             good = sum(1 for d in drives if d['state'] == 'ok')
             bad = sum(1 for d in drives if d['state'] != 'ok')
             scanning = sum(1 for d in drives if d.get('scanning', False))
+            
+            # Filter by minimum bad disks threshold if specified
+            if min_bad_disks_threshold is not None:
+                if bad < min_bad_disks_threshold:
+                    continue  # Skip erasure sets with bad disk count < threshold (show >= threshold)
             
             # Calculate averages for space and inode metrics
             total_drives = len(drives)
