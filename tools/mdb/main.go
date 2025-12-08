@@ -4,13 +4,22 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"math"
+	"net"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbles/viewport"
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/dustin/go-humanize"
 	"github.com/minio/cli"
+	"github.com/minio/madmin-go/v3"
 	"github.com/minio/pkg/v3/console"
 )
 
@@ -24,6 +33,13 @@ const (
 	Reset  = "\033[0m"
 )
 
+// clusterStruct wraps Info message together with fields "Status" and "Error"
+type clusterStruct struct {
+	Status string             `json:"status"`
+	Error  string             `json:"error,omitempty"`
+	Info   madmin.InfoMessage `json:"info,omitempty"`
+}
+
 // Config holds command-line configuration
 type Config struct {
 	JSONFile          string
@@ -33,6 +49,7 @@ type Config struct {
 	FailedMode        bool
 	LowSpaceThreshold *float64
 	MinBadDisks       *int
+	TrimDomain        string
 }
 
 // DiskInfo represents a single disk
@@ -49,7 +66,7 @@ type DiskInfo struct {
 	UsedInodes     int64
 	FreeInodes     int64
 	Local          bool
-	Metrics        interface{}
+	Metrics        *madmin.DiskMetrics
 	PoolIndex      int
 	SetIndex       int
 	FreeSpacePct   float64
@@ -81,64 +98,115 @@ type ClusterStats struct {
 	ParityDisks   int
 }
 
-// Pager handles paginated output
+// Pager handles paginated output using bubbletea and viewport
 type Pager struct {
-	enabled      bool
-	linesPrinted int
-	linesPerPage int
+	enabled bool
+	buffer  *strings.Builder
 }
 
 func NewPager(enabled bool) *Pager {
-	p := &Pager{enabled: enabled}
-	if enabled {
-		p.linesPerPage = 22 // Default terminal height - 2
-	} else {
-		p.linesPerPage = 999999
+	return &Pager{
+		enabled: enabled,
+		buffer:  &strings.Builder{},
 	}
-	return p
 }
 
 func (p *Pager) Printf(format string, args ...interface{}) {
-	if !p.enabled {
-		fmt.Printf(format, args...)
-		return
-	}
-
 	text := fmt.Sprintf(format, args...)
-	lines := strings.Split(text, "\n")
-	for i, line := range lines {
-		fmt.Print(line)
-		if i < len(lines)-1 {
-			fmt.Print("\n")
-		}
-		p.linesPrinted++
-
-		if p.linesPrinted >= p.linesPerPage {
-			fmt.Printf("\n%s-- Press SPACE to continue, 'q' to quit --%s", Yellow, Reset)
-			p.waitForSpace()
-			fmt.Print("\r" + strings.Repeat(" ", 50) + "\r")
-			p.linesPrinted = 0
-		}
+	if p.enabled {
+		p.buffer.WriteString(text)
+	} else {
+		fmt.Printf(format, args...)
 	}
 }
 
-func (p *Pager) waitForSpace() {
+// Show displays the buffered output using bubbletea viewport
+func (p *Pager) Show() {
 	if !p.enabled {
 		return
 	}
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		char, _, err := reader.ReadRune()
-		if err != nil {
-			return
-		}
-		if char == ' ' {
-			break
-		}
-		if char == 'q' {
-			os.Exit(0)
+
+	content := p.buffer.String()
+	if content == "" {
+		return
+	}
+
+	pager := newViewportModel(content)
+	if err := tea.NewProgram(pager, tea.WithAltScreen()).Start(); err != nil {
+		fmt.Print(content)
+	}
+}
+
+// viewportModel holds the state for the viewport pager
+type viewportModel struct {
+	viewport viewport.Model
+	content  string
+}
+
+func newViewportModel(content string) viewportModel {
+	vp := viewport.New(0, 0)
+	vp.SetContent(content)
+
+	return viewportModel{
+		viewport: vp,
+		content:  content,
+	}
+}
+
+func (m viewportModel) Init() tea.Cmd {
+	// Request initial window size
+	return tea.WindowSize()
+}
+
+func (m viewportModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	var cmd tea.Cmd
+
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.viewport.Width = msg.Width
+		m.viewport.Height = msg.Height - 1 // Reserve space for help text
+		m.viewport.SetContent(m.content) // Re-set content with new dimensions
+		return m, nil
+
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "q", "Q", "ctrl+c":
+			return m, tea.Quit
+		case "up", "k":
+			m.viewport.LineUp(1)
+			return m, nil
+		case "down", "j":
+			m.viewport.LineDown(1)
+			return m, nil
+		case " ":
+			// Space scrolls half a page down (more convenient for quick navigation)
+			m.viewport.HalfViewDown()
+			return m, nil
+		case "pgdown", "ctrl+f":
+			m.viewport.HalfViewDown()
+			return m, nil
+		case "pgup", "ctrl+b":
+			m.viewport.HalfViewUp()
+			return m, nil
+		case "home", "g":
+			m.viewport.GotoTop()
+			return m, nil
+		case "end", "G":
+			m.viewport.GotoBottom()
+			return m, nil
 		}
 	}
+
+	m.viewport, cmd = m.viewport.Update(msg)
+	return m, cmd
+}
+
+func (m viewportModel) View() string {
+	helpText := lipgloss.NewStyle().
+		Foreground(lipgloss.Color("241")).
+		Render(" ↑/↓/j/k: scroll  space: page down  g/G: top/bottom  q: quit")
+	
+	return fmt.Sprintf("%s\n%s", m.viewport.View(), helpText)
 }
 
 func main() {
@@ -155,6 +223,14 @@ func main() {
 }
 
 func mainMDB(ctx *cli.Context) error {
+	// Check for --help or -h flag anywhere in arguments
+	for _, arg := range os.Args[1:] {
+		if arg == "--help" || arg == "-h" {
+			cli.ShowAppHelp(ctx)
+			return nil
+		}
+	}
+	
 	config := parseFlags(ctx)
 
 	if config.JSONFile == "" {
@@ -162,20 +238,20 @@ func mainMDB(ctx *cli.Context) error {
 		return fmt.Errorf("JSON file is required")
 	}
 
-	data, err := loadJSON(config.JSONFile)
+	infoStruct, err := loadJSON(config.JSONFile)
 	if err != nil {
 		return fmt.Errorf("failed to load JSON file '%s': %v", config.JSONFile, err)
 	}
 
-	servers, infoPath, err := extractServers(data)
-	if err != nil {
-		return fmt.Errorf("failed to extract servers: %v", err)
+	servers := infoStruct.Info.Servers
+	pools := extractPoolsFromServers(servers)
+	parityDisks := int(infoStruct.Info.Backend.StandardSCParity)
+	if parityDisks == 0 {
+		parityDisks = 2 // Default to EC-2
 	}
 
-	pools := extractPools(infoPath, servers)
-	parityDisks := getErasureCodingConfig(servers)
-
 	pager := NewPager(config.PagerMode)
+	
 	pager.Printf("%sDetected Erasure Coding Configuration: EC:%d%s\n", Bold, parityDisks, Reset)
 	pager.Printf("\n")
 
@@ -185,7 +261,7 @@ func mainMDB(ctx *cli.Context) error {
 
 	// Process all drives
 	for _, server := range servers {
-		drives := getDrives(server)
+		drives := getDrives(server, config.TrimDomain)
 		for _, drive := range drives {
 			stats.TotalDisks++
 			if drive.Scanning {
@@ -215,24 +291,30 @@ func mainMDB(ctx *cli.Context) error {
 		}
 	}
 
-	stats.DeploymentID = getDeploymentID(infoPath)
+	stats.DeploymentID = infoStruct.Info.DeploymentID
 
 	// Print cluster summary (use all drives for capacity calculation)
-	printClusterSummary(pager, stats, pools, allPoolSetDrives, servers, config)
+	printClusterSummary(pager, stats, pools, allPoolSetDrives, servers, infoStruct, config)
 
 	// Handle special modes
 	if config.FailedMode && !config.SummaryMode {
 		printFailedDisksTable(pager, poolSetDrives, config)
+		pager.Show()
 		return nil
 	}
 
 	if config.SummaryMode && config.LowSpaceThreshold != nil {
 		printLowSpaceErasureSets(pager, pools, poolSetDrives, *config.LowSpaceThreshold, config)
+		pager.Show()
 		return nil
 	}
 
 	// Print pools and erasure sets
-	printPoolsAndSets(pager, pools, poolSetDrives, allPoolSetDrives, config)
+	printPoolsAndSets(pager, pools, poolSetDrives, allPoolSetDrives, config, servers)
+	
+	// Show the pager if enabled
+	pager.Show()
+	
 	return nil
 }
 
@@ -260,6 +342,10 @@ var mdbFlags = []cli.Flag{
 	cli.StringFlag{
 		Name:  "min-bad-disks",
 		Usage: "Filter by minimum bad disks (requires --summary --failed)",
+	},
+	cli.StringFlag{
+		Name:  "trim-domain",
+		Usage: "Trim domain suffix from endpoint names for cleaner display (e.g., '.example.com')",
 	},
 }
 
@@ -303,75 +389,133 @@ NOTES:
 func parseFlags(ctx *cli.Context) *Config {
 	config := &Config{}
 
-	// Get JSON file from arguments
-	if ctx.NArg() < 1 {
-		return config // Will be caught in mainMDB
-	}
-	config.JSONFile = ctx.Args().Get(0)
-
-	config.SummaryMode = ctx.Bool("summary")
-	config.ScanningMode = ctx.Bool("scanning")
-	config.PagerMode = ctx.Bool("pager")
-	config.FailedMode = ctx.Bool("failed")
-
-	// Parse low-space threshold
-	if lowSpaceStr := ctx.String("low-space"); lowSpaceStr != "" {
-		val, err := strconv.ParseFloat(lowSpaceStr, 64)
-		if err != nil {
-			console.Fatalln(fmt.Errorf("Invalid --low-space value. Must be a number: %v", err))
-		}
-		config.LowSpaceThreshold = &val
-		if !config.SummaryMode {
-			console.Fatalln(fmt.Errorf("--low-space option requires --summary mode"))
+	// Get all arguments manually to handle flags that come after positional args
+	// This handles both: mdb --pager file.json and mdb file.json --pager
+	allArgs := os.Args[1:] // Skip program name
+	
+	// Find JSON file (first non-flag argument)
+	var jsonFile string
+	for _, arg := range allArgs {
+		if !strings.HasPrefix(arg, "-") && arg != "" {
+			jsonFile = arg
+			break
 		}
 	}
+	
+	// Manually parse all flags from command line
+	// This ensures flags work whether they come before or after the file
+	for _, arg := range allArgs {
+		if arg == "--pager" {
+			config.PagerMode = true
+		}
+		if arg == "--summary" {
+			config.SummaryMode = true
+		}
+		if arg == "--scanning" {
+			config.ScanningMode = true
+		}
+		if arg == "--failed" {
+			config.FailedMode = true
+		}
+		if strings.HasPrefix(arg, "--trim-domain=") {
+			parts := strings.SplitN(arg, "=", 2)
+			if len(parts) == 2 {
+				config.TrimDomain = parts[1]
+			}
+		}
+		if strings.HasPrefix(arg, "--low-space=") {
+			parts := strings.SplitN(arg, "=", 2)
+			if len(parts) == 2 {
+				if val, err := strconv.ParseFloat(parts[1], 64); err == nil {
+					config.LowSpaceThreshold = &val
+				}
+			}
+		}
+		if strings.HasPrefix(arg, "--min-bad-disks=") {
+			parts := strings.SplitN(arg, "=", 2)
+			if len(parts) == 2 {
+				if val, err := strconv.Atoi(parts[1]); err == nil && val >= 0 {
+					config.MinBadDisks = &val
+				}
+			}
+		}
+	}
+	
+	// Also check context (in case flags were parsed before positional args)
+	// Use OR to combine with manually parsed flags
+	config.SummaryMode = config.SummaryMode || ctx.Bool("summary")
+	config.ScanningMode = config.ScanningMode || ctx.Bool("scanning")
+	config.PagerMode = config.PagerMode || ctx.Bool("pager")
+	config.FailedMode = config.FailedMode || ctx.Bool("failed")
+	if config.TrimDomain == "" {
+		config.TrimDomain = ctx.String("trim-domain")
+	}
+	
+	config.JSONFile = jsonFile
+	
+	// Use ctx.Args() as fallback if manual parsing didn't find the file
+	if config.JSONFile == "" && ctx.NArg() >= 1 {
+		config.JSONFile = ctx.Args().Get(0)
+	}
 
-	// Parse min-bad-disks threshold
-	if minBadDisksStr := ctx.String("min-bad-disks"); minBadDisksStr != "" {
-		val, err := strconv.Atoi(minBadDisksStr)
-		if err != nil || val < 0 {
-			console.Fatalln(fmt.Errorf("Invalid --min-bad-disks value. Must be a non-negative integer: %v", err))
-		}
-		config.MinBadDisks = &val
-		if !config.SummaryMode || !config.FailedMode {
-			console.Fatalln(fmt.Errorf("--min-bad-disks option requires --summary --failed mode"))
-		}
+	// Validate flag dependencies
+	if config.LowSpaceThreshold != nil && !config.SummaryMode {
+		console.Fatalln(fmt.Errorf("--low-space option requires --summary mode"))
+	}
+	if config.MinBadDisks != nil && (!config.SummaryMode || !config.FailedMode) {
+		console.Fatalln(fmt.Errorf("--min-bad-disks option requires --summary --failed mode"))
 	}
 
 	return config
 }
 
-func loadJSON(filename string) (map[string]interface{}, error) {
+func loadJSON(filename string) (*clusterStruct, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, fmt.Errorf("file '%s' not found: %v", filename, err)
 	}
 	defer file.Close()
 
-	// Try loading as single JSON first
-	decoder := json.NewDecoder(file)
-	var data map[string]interface{}
-	err = decoder.Decode(&data)
-	if err == nil {
-		// Check if it has the expected structure
-		if _, hasInfo := data["info"]; !hasInfo {
-			if minio, ok := data["minio"].(map[string]interface{}); ok {
-				if _, hasMinioInfo := minio["info"]; !hasMinioInfo {
-					// Might be NDJSON, try reading line by line
-					return loadNDJSON(filename)
-				}
-			} else {
-				return loadNDJSON(filename)
-			}
-		}
-		return data, nil
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read file '%s': %v", filename, err)
 	}
 
-	// If single JSON load fails, try NDJSON format
-	return loadNDJSON(filename)
+	// Check for raw prefix and remove it (like stats does)
+	data = []byte(strings.Replace(string(data), `{"version":"3"}`, "", 1))
+
+	infoStruct := clusterStruct{}
+	err = json.Unmarshal(data, &infoStruct)
+	if err != nil {
+		// Try with minio wrapper format
+		anotherFormat := struct {
+			InfoStruct clusterStruct `json:"minio"`
+		}{}
+		err = json.Unmarshal(data, &anotherFormat)
+		if err != nil {
+			// Try NDJSON format
+			return loadNDJSON(filename)
+		}
+		return &anotherFormat.InfoStruct, nil
+	}
+
+	// If there is no server found on the first try, trying with different format
+	// data could be from subnet diagnostics page
+	if len(infoStruct.Info.Servers) == 0 {
+		anotherFormat := struct {
+			InfoStruct clusterStruct `json:"minio"`
+		}{}
+		err = json.Unmarshal(data, &anotherFormat)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal JSON: %v", err)
+		}
+		return &anotherFormat.InfoStruct, nil
+	}
+
+	return &infoStruct, nil
 }
 
-func loadNDJSON(filename string) (map[string]interface{}, error) {
+func loadNDJSON(filename string) (*clusterStruct, error) {
 	file, err := os.Open(filename)
 	if err != nil {
 		return nil, err
@@ -384,77 +528,33 @@ func loadNDJSON(filename string) (map[string]interface{}, error) {
 		if len(line) == 0 {
 			continue
 		}
-		var lineData map[string]interface{}
-		if err := json.Unmarshal(line, &lineData); err != nil {
-			continue
+		var infoStruct clusterStruct
+		if err := json.Unmarshal(line, &infoStruct); err == nil {
+			if len(infoStruct.Info.Servers) > 0 {
+				return &infoStruct, nil
+			}
 		}
-		// Look for MinIO diagnostic data
-		if _, ok := lineData["minio"]; ok {
-			return lineData, nil
-		}
-		if _, ok := lineData["info"]; ok {
-			return lineData, nil
+		// Try with minio wrapper
+		anotherFormat := struct {
+			InfoStruct clusterStruct `json:"minio"`
+		}{}
+		if err := json.Unmarshal(line, &anotherFormat); err == nil {
+			if len(anotherFormat.InfoStruct.Info.Servers) > 0 {
+				return &anotherFormat.InfoStruct, nil
+			}
 		}
 	}
 	return nil, fmt.Errorf("no valid JSON found")
 }
 
-func extractServers(data map[string]interface{}) ([]map[string]interface{}, map[string]interface{}, error) {
-	var servers []map[string]interface{}
-	var infoPath map[string]interface{}
-
-	// Try diagnostic format: minio.info.servers
-	if minio, ok := data["minio"].(map[string]interface{}); ok {
-		if info, ok := minio["info"].(map[string]interface{}); ok {
-			if srv, ok := info["servers"].([]interface{}); ok {
-				servers = make([]map[string]interface{}, len(srv))
-				for i, s := range srv {
-					servers[i] = s.(map[string]interface{})
-				}
-				infoPath = info
-				return servers, infoPath, nil
-			}
-		}
-	}
-
-	// Try standard format: info.servers
-	if info, ok := data["info"].(map[string]interface{}); ok {
-		if srv, ok := info["servers"].([]interface{}); ok {
-			servers = make([]map[string]interface{}, len(srv))
-			for i, s := range srv {
-				servers[i] = s.(map[string]interface{})
-			}
-			infoPath = info
-			return servers, infoPath, nil
-		}
-	}
-
-	keys := make([]string, 0, len(data))
-	for k := range data {
-		keys = append(keys, k)
-	}
-	return nil, nil, fmt.Errorf("could not find servers in JSON structure. Available top-level keys: %v", keys)
-}
-
-func extractPools(infoPath map[string]interface{}, servers []map[string]interface{}) map[string]map[string]interface{} {
+func extractPoolsFromServers(servers []madmin.ServerProperties) map[string]map[string]interface{} {
 	pools := make(map[string]map[string]interface{})
-
-	if poolsData, ok := infoPath["pools"].(map[string]interface{}); ok {
-		for poolIdx, setsData := range poolsData {
-			if sets, ok := setsData.(map[string]interface{}); ok {
-				pools[poolIdx] = sets
-			}
-		}
-		return pools
-	}
 
 	// Build pools structure from drive information
 	for _, server := range servers {
-		drives, _ := server["drives"].([]interface{})
-		for _, d := range drives {
-			drive := d.(map[string]interface{})
-			poolIdx := getInt(drive, "pool_index", 0)
-			setIdx := getInt(drive, "set_index", 0)
+		for _, disk := range server.Disks {
+			poolIdx := disk.PoolIndex
+			setIdx := disk.SetIndex
 			poolKey := strconv.Itoa(poolIdx)
 			setKey := strconv.Itoa(setIdx)
 
@@ -469,65 +569,39 @@ func extractPools(infoPath map[string]interface{}, servers []map[string]interfac
 	return pools
 }
 
-func getErasureCodingConfig(servers []map[string]interface{}) int {
-	for _, server := range servers {
-		if envVars, ok := server["minio_env_vars"].(map[string]interface{}); ok {
-			if ecConfig, ok := envVars["MINIO_STORAGE_CLASS_STANDARD"].(string); ok {
-				if strings.HasPrefix(ecConfig, "EC:") {
-					parts := strings.Split(ecConfig, ":")
-					if len(parts) > 1 {
-						if val, err := strconv.Atoi(parts[1]); err == nil {
-							return val
-						}
-					}
-				}
-			}
-		}
-	}
-	return 2 // Default to EC-2
+func getErasureCodingConfig(servers []madmin.ServerProperties) int {
+	// Try to determine from backend info if available in infoStruct
+	// For now, use standardSCParity if available, otherwise default
+	// This will be set from infoStruct.Info.Backend.StandardSCParity in mainMDB
+	return 2 // Default to EC-2, will be updated if available from backend
 }
 
-func getDeploymentID(infoPath map[string]interface{}) string {
-	if id, ok := infoPath["deploymentID"].(string); ok {
-		return id
-	}
-	return "Not available"
-}
+func getDrives(server madmin.ServerProperties, trimDomain string) []DiskInfo {
+	serverEndpoint := trimDomainData(server.Endpoint, trimDomain)
+	drives := make([]DiskInfo, 0, len(server.Disks))
 
-func getDrives(server map[string]interface{}) []DiskInfo {
-	drivesData, ok := server["drives"].([]interface{})
-	if !ok {
-		return nil
-	}
-
-	serverEndpoint := getString(server, "endpoint", "unknown")
-	drives := make([]DiskInfo, 0, len(drivesData))
-
-	for _, d := range drivesData {
-		drive := d.(map[string]interface{})
+	for _, disk := range server.Disks {
 		diskInfo := DiskInfo{
 			Server:         serverEndpoint,
-			Path:           getString(drive, "path", ""),
-			State:          getString(drive, "state", "unknown"),
-			UUID:           getString(drive, "uuid", "N/A"),
-			Scanning:       getBool(drive, "scanning", false),
-			DiskIndex:      drive["disk_index"],
-			TotalSpace:     getInt64(drive, "totalspace", 0),
-			UsedSpace:      getInt64(drive, "usedspace", 0),
-			AvailableSpace: getInt64(drive, "availspace", 0),
-			UsedInodes:     getInt64(drive, "used_inodes", 0),
-			FreeInodes:     getInt64(drive, "free_inodes", 0),
-			Local:          getBool(drive, "local", false),
-			Metrics:        drive["metrics"],
-			PoolIndex:      getInt(drive, "pool_index", 0),
-			SetIndex:       getInt(drive, "set_index", 0),
+			Path:           disk.DrivePath,
+			State:          disk.State,
+			UUID:           disk.UUID,
+			Scanning:       disk.Healing,
+			DiskIndex:      disk.DiskIndex,
+			TotalSpace:     int64(disk.TotalSpace),
+			UsedSpace:      int64(disk.UsedSpace),
+			AvailableSpace: int64(disk.AvailableSpace),
+			UsedInodes:     int64(disk.UsedInodes),
+			FreeInodes:     int64(disk.FreeInodes),
+			Local:          disk.Local,
+			Metrics:        disk.Metrics,
+			PoolIndex:      disk.PoolIndex,
+			SetIndex:       disk.SetIndex,
 		}
 
 		// Extract path from endpoint if path is not provided
-		if diskInfo.Path == "" {
-			if endpoint, ok := drive["endpoint"].(string); ok {
-				diskInfo.Path = extractPathFromEndpoint(endpoint)
-			}
+		if diskInfo.Path == "" && disk.Endpoint != "" {
+			diskInfo.Path = extractPathFromEndpoint(disk.Endpoint)
 		}
 
 		// Calculate percentages
@@ -594,21 +668,28 @@ func getBool(m map[string]interface{}, key string, defaultValue bool) bool {
 	return defaultValue
 }
 
-func printClusterSummary(pager *Pager, stats ClusterStats, pools map[string]map[string]interface{}, poolSetDrives map[string][]DiskInfo, servers []map[string]interface{}, config *Config) {
-	pager.Printf("%sMinIO Cluster Summary%s\n", Bold, Reset)
-	pager.Printf("==================================================\n")
+func printClusterSummary(pager *Pager, stats ClusterStats, pools map[string]map[string]interface{}, poolSetDrives map[string][]DiskInfo, servers []madmin.ServerProperties, infoStruct *clusterStruct, config *Config) {
+	pager.Printf("%sSummary%s\n", Bold, Reset)
 
 	if stats.DeploymentID != "" {
-		pager.Printf("Deployment ID: %s\n", stats.DeploymentID)
+		pager.Printf("  Deployment ID: %s\n", stats.DeploymentID)
 	} else {
-		pager.Printf("Deployment ID: Not available\n")
+		pager.Printf("  Deployment ID: Not available\n")
 	}
+
+	// Backend configuration
+	if infoStruct != nil && len(infoStruct.Info.Backend.TotalSets) > 0 {
+		totalSetsStr := fmt.Sprintf("%v", infoStruct.Info.Backend.TotalSets)
+		pager.Printf("  Backend: totalSets=%s, standardSCParity=%d, rrSCParity=%d, drivesPerSet=%v\n",
+			totalSetsStr, infoStruct.Info.Backend.StandardSCParity, infoStruct.Info.Backend.RRSCParity, infoStruct.Info.Backend.DrivesPerSet)
+	}
+
 	pager.Printf("\n")
 
-	pager.Printf("Total Disks: %d\n", stats.TotalDisks)
-	pager.Printf("Scanning Disks: %s%d%s\n", Yellow, stats.ScanningDisks, Reset)
-	pager.Printf("Healthy Disks: %s%d%s\n", Green, stats.OkDisks, Reset)
-	pager.Printf("Problem Disks: %s%d%s\n", Red, stats.BadDisks, Reset)
+	pager.Printf("  Total Disks: %d\n", stats.TotalDisks)
+	pager.Printf("  Scanning Disks: %s%d%s\n", Yellow, stats.ScanningDisks, Reset)
+	pager.Printf("  Healthy Disks: %s%d%s\n", Green, stats.OkDisks, Reset)
+	pager.Printf("  Problem Disks: %s%d%s\n", Red, stats.BadDisks, Reset)
 
 	if stats.TotalDisks > 0 {
 		healthPct := float64(stats.OkDisks) / float64(stats.TotalDisks) * 100
@@ -620,7 +701,7 @@ func printClusterSummary(pager *Pager, stats ClusterStats, pools map[string]map[
 		} else {
 			healthColor = Red
 		}
-		pager.Printf("Health: %s%.1f%%%s\n", healthColor, healthPct, Reset)
+		pager.Printf("  Health: %s%.1f%%%s\n", healthColor, healthPct, Reset)
 	}
 
 	if stats.TotalSpace > 0 {
@@ -660,106 +741,29 @@ func printClusterSummary(pager *Pager, stats ClusterStats, pools map[string]map[
 			usageColor = Red
 		}
 
-		pager.Printf("Raw Capacity: %.1f TB\n", totalTB)
-		pager.Printf("Usable Capacity: %.1f TB\n", usableTB)
-		pager.Printf("Used Space: %.1f TB (%s%.1f%%%s)\n", usedTB, usageColor, usagePct, Reset)
-		pager.Printf("Available Space: %.1f TB\n", usableTB-usedTB)
+		pager.Printf("  Raw Capacity: %.1f TB\n", totalTB)
+		pager.Printf("  Usable Capacity: %.1f TB\n", usableTB)
+		pager.Printf("  Used Space: %.1f TB (%s%.1f%%%s)\n", usedTB, usageColor, usagePct, Reset)
+		pager.Printf("  Available Space: %.1f TB\n", usableTB-usedTB)
 	}
 
-	pager.Printf("Pools: %d\n", len(pools))
-	pager.Printf("Servers: %d\n", len(servers))
+	pager.Printf("  Pools: %d\n", len(pools))
+	pager.Printf("  Servers: %d\n", len(servers))
 
 	totalErasureSets := 0
 	for _, sets := range pools {
 		totalErasureSets += len(sets)
 	}
-	pager.Printf("Erasure Sets: %d\n", totalErasureSets)
-	pager.Printf("==================================================\n")
+	pager.Printf("  Erasure Sets: %d\n", totalErasureSets)
 
-	// Pool Summary
-	pager.Printf("%sPool Summary%s\n", Bold, Reset)
-	pager.Printf("--------------------------------------------------\n")
-
-	for poolIdx, sets := range pools {
-		poolTotalDisks := 0
-		poolOkDisks := 0
-		poolBadDisks := 0
-		poolScanningDisks := 0
-		poolTotalSpace := int64(0)
-		poolUsedSpace := int64(0)
-		poolUsableSpace := int64(0)
-
-		for setIdx := range sets {
-			key := fmt.Sprintf("%s:%s", poolIdx, setIdx)
-			drives := poolSetDrives[key]
-			totalDisksInSet := len(drives)
-			if totalDisksInSet > 0 {
-				var usableRatio float64
-				if totalDisksInSet >= stats.ParityDisks {
-					dataDisks := totalDisksInSet - stats.ParityDisks
-					usableRatio = float64(dataDisks) / float64(totalDisksInSet)
-				}
-
-				for _, drive := range drives {
-					poolTotalDisks++
-					if drive.State == "ok" {
-						poolOkDisks++
-					} else {
-						poolBadDisks++
-					}
-					if drive.Scanning {
-						poolScanningDisks++
-					}
-					poolTotalSpace += drive.TotalSpace
-					poolUsedSpace += drive.UsedSpace
-					poolUsableSpace += int64(float64(drive.TotalSpace) * usableRatio)
-				}
-			}
-		}
-
-		poolHealthPct := float64(poolOkDisks) / float64(poolTotalDisks) * 100
-		if poolTotalDisks == 0 {
-			poolHealthPct = 0
-		}
-		var poolHealthColor string
-		if poolHealthPct >= 90 {
-			poolHealthColor = Green
-		} else if poolHealthPct >= 75 {
-			poolHealthColor = Yellow
-		} else {
-			poolHealthColor = Red
-		}
-
-		poolUsagePct := float64(poolUsedSpace) / float64(poolUsableSpace) * 100
-		if poolUsableSpace == 0 {
-			poolUsagePct = 0
-		}
-		var poolUsageColor string
-		if poolUsagePct < 80 {
-			poolUsageColor = Green
-		} else if poolUsagePct < 95 {
-			poolUsageColor = Yellow
-		} else {
-			poolUsageColor = Red
-		}
-
-		poolTotalTB := float64(poolTotalSpace) / (1024 * 1024 * 1024 * 1024)
-		poolUsableTB := float64(poolUsableSpace) / (1024 * 1024 * 1024 * 1024)
-		poolUsedTB := float64(poolUsedSpace) / (1024 * 1024 * 1024 * 1024)
-
-		pager.Printf("Pool %s:\n", poolIdx)
-		pager.Printf("  Erasure Sets: %d\n", len(sets))
-		pager.Printf("  Disks: %d total (%s%d ok%s, %s%d bad%s, %s%d scanning%s)\n",
-			poolTotalDisks, Green, poolOkDisks, Reset, Red, poolBadDisks, Reset, Yellow, poolScanningDisks, Reset)
-		pager.Printf("  Health: %s%.1f%%%s\n", poolHealthColor, poolHealthPct, Reset)
-		pager.Printf("  Raw Capacity: %.1f TB\n", poolTotalTB)
-		pager.Printf("  Usable Capacity: %.1f TB\n", poolUsableTB)
-		pager.Printf("  Usage: %.1f TB (%s%.1f%%%s)\n", poolUsedTB, poolUsageColor, poolUsagePct, Reset)
-		pager.Printf("  Available: %.1f TB\n", poolUsableTB-poolUsedTB)
-		pager.Printf("\n")
+	// Scanner status
+	if infoStruct != nil {
+		pager.Printf("  Scanner Status: buckets=%d, objects=%d, versions=%d, deletemarkers=%d, usage=%s\n",
+			infoStruct.Info.Buckets.Count, infoStruct.Info.Objects.Count,
+			infoStruct.Info.Versions.Count, infoStruct.Info.DeleteMarkers.Count,
+			humanize.IBytes(infoStruct.Info.Usage.Size))
 	}
 
-	pager.Printf("==================================================\n")
 	pager.Printf("\n")
 }
 
@@ -924,85 +928,276 @@ func printLowSpaceErasureSets(pager *Pager, pools map[string]map[string]interfac
 	}
 }
 
-func printPoolsAndSets(pager *Pager, pools map[string]map[string]interface{}, poolSetDrives map[string][]DiskInfo, allPoolSetDrives map[string][]DiskInfo, config *Config) {
-	var title string
-	if config.ScanningMode {
-		title = "MinIO Scanning Disks"
-	} else if config.FailedMode {
-		title = "MinIO Failed/Faulty Disks"
-	} else {
-		title = "MinIO Pool Information"
+// printServerInfo prints server metadata for all servers in table format
+func printServerInfo(pager *Pager, servers []madmin.ServerProperties, pools map[string]map[string]interface{}, trimDomain string) {
+	pager.Printf("%sServers%s\n", Bold, Reset)
+	
+	// Collect all unique servers and determine which pools each belongs to
+	serversData := make(map[string]struct {
+		server  madmin.ServerProperties
+		pools   []int
+	})
+	
+	// Build map of valid pool indices from pools map
+	validPools := make(map[int]bool)
+	for poolKey := range pools {
+		if poolIdx, err := strconv.Atoi(poolKey); err == nil {
+			validPools[poolIdx] = true
+		}
 	}
-	pager.Printf("%s%s from: %s%s\n", Bold, title, config.JSONFile, Reset)
-	pager.Printf("================================================================================\n")
 
-	for poolIdx, sets := range pools {
-		// Check if pool has failed disks (for failed mode) - use all drives for checking
-		poolHasFailed := false
-		if config.FailedMode {
-			for setIdx := range sets {
-				key := fmt.Sprintf("%s:%s", poolIdx, setIdx)
-				drives := allPoolSetDrives[key]
-				if len(drives) == 0 {
-					drives = poolSetDrives[key] // Fallback
-				}
-				for _, d := range drives {
-					if d.State != "ok" {
-						poolHasFailed = true
+	// Build map of servers to their pool membership
+	for _, server := range servers {
+		endpointName := trimDomainData(server.Endpoint, trimDomain)
+		
+		// Collect all pools this server belongs to by checking its disks
+		// Only include pools that exist in the valid pools map
+		poolSet := make(map[int]bool)
+		for _, disk := range server.Disks {
+			if validPools[disk.PoolIndex] {
+				poolSet[disk.PoolIndex] = true
+			}
+		}
+		
+		// Convert pool set to sorted slice
+		var poolList []int
+		for poolIdx := range poolSet {
+			poolList = append(poolList, poolIdx)
+		}
+		sort.Ints(poolList)
+		
+		// Store or update server data
+		if existing, exists := serversData[endpointName]; exists {
+			// Merge pool lists and deduplicate
+			allPools := make(map[int]bool)
+			for _, p := range existing.pools {
+				allPools[p] = true
+			}
+			for _, p := range poolList {
+				allPools[p] = true
+			}
+			var mergedPools []int
+			for p := range allPools {
+				mergedPools = append(mergedPools, p)
+			}
+			sort.Ints(mergedPools)
+			serversData[endpointName] = struct {
+				server  madmin.ServerProperties
+				pools   []int
+			}{server: existing.server, pools: mergedPools}
+		} else {
+			serversData[endpointName] = struct {
+				server  madmin.ServerProperties
+				pools   []int
+			}{server: server, pools: poolList}
+		}
+	}
+
+	if len(serversData) == 0 {
+		pager.Printf("\n")
+		return
+	}
+
+	// Get sorted server names (natural/alphanumeric sort)
+	serverNames := make([]string, 0, len(serversData))
+	for name := range serversData {
+		serverNames = append(serverNames, name)
+	}
+	sort.Slice(serverNames, func(i, j int) bool {
+		return naturalLess(serverNames[i], serverNames[j])
+	})
+
+	// Prepare table data
+	headers := []string{"Pool", "Server", "State", "Edition", "Version", "Commit ID", "Memory", "ILM Status", "Uptime"}
+	rows := make([][]string, 0, len(serverNames))
+
+	for _, serverName := range serverNames {
+		data := serversData[serverName]
+		server := data.server
+
+		// Format pool list
+		var poolStr string
+		if len(data.pools) == 0 {
+			poolStr = "N/A"
+		} else {
+			poolStrs := make([]string, len(data.pools))
+			for i, p := range data.pools {
+				poolStrs[i] = strconv.Itoa(p)
+			}
+			poolStr = strings.Join(poolStrs, ",")
+		}
+
+		// Color code state
+		stateColor := Green
+		if server.State == "offline" {
+			stateColor = Red
+		}
+		stateText := fmt.Sprintf("%s%s%s", stateColor, server.State, Reset)
+
+		// Format commit ID (use full commit ID, no truncation)
+		commitID := server.CommitID
+
+		// Format ILM status
+		ilmStatus := "false"
+		if server.ILMExpiryInProgress {
+			ilmStatus = "true"
+		}
+
+		// Format uptime
+		uptime := humanizeDuration(time.Duration(server.Uptime) * time.Second)
+
+		row := make([]string, len(headers))
+		row[0] = poolStr
+		row[1] = serverName
+		row[2] = stateText
+		row[3] = server.Edition
+		row[4] = server.Version
+		row[5] = commitID
+		row[6] = humanize.IBytes(server.MemStats.Alloc)
+		row[7] = ilmStatus
+		if server.State == "offline" {
+			row[8] = "N/A"
+		} else {
+			row[8] = uptime
+		}
+
+		rows = append(rows, row)
+	}
+
+	// Calculate column widths
+	widths := make([]int, len(headers))
+	for i, h := range headers {
+		widths[i] = utf8.RuneCountInString(h)
+	}
+	for _, row := range rows {
+		for i, cell := range row {
+			// Strip ANSI codes for width calculation
+			cleanCell := stripANSI(cell)
+			if w := utf8.RuneCountInString(cleanCell); w > widths[i] {
+				widths[i] = w
+			}
+		}
+	}
+
+	// Print header
+	pager.Printf("  ")
+	for i, h := range headers {
+		pager.Printf("%s", padString(h, widths[i]))
+		if i < len(headers)-1 {
+			pager.Printf("  ")
+		}
+	}
+	pager.Printf("\n")
+
+	// Print separator
+	pager.Printf("  ")
+	for i, w := range widths {
+		pager.Printf("%s", strings.Repeat("-", w))
+		if i < len(widths)-1 {
+			pager.Printf("  ")
+		}
+	}
+	pager.Printf("\n")
+
+	// Print rows
+	for _, row := range rows {
+		pager.Printf("  ")
+		for i, cell := range row {
+			pager.Printf("%s", padString(cell, widths[i]))
+			if i < len(row)-1 {
+				pager.Printf("  ")
+			}
+		}
+		pager.Printf("\n")
+	}
+	pager.Printf("\n")
+}
+
+func printPoolsAndSets(pager *Pager, pools map[string]map[string]interface{}, poolSetDrives map[string][]DiskInfo, allPoolSetDrives map[string][]DiskInfo, config *Config, servers []madmin.ServerProperties) {
+	// Print server information once for all pools
+	printServerInfo(pager, servers, pools, config.TrimDomain)
+
+	// Collect all drives from all pools and erasure sets
+	allDrives := make([]DiskInfo, 0)
+	
+	// For summary mode, collect erasure set statistics and display in table format
+	if config.SummaryMode {
+		type ErasureSetSummary struct {
+			PoolIndex       int
+			SetIndex        int
+			GoodDisks       int
+			BadDisks        int
+			ScanningDisks   int
+			AvgSpaceUsedPct float64
+			AvgFreeSpacePct float64
+			AvgInodesUsedPct float64
+		}
+		
+		erasureSetSummaries := make([]ErasureSetSummary, 0)
+		
+		for poolIdx, sets := range pools {
+			// Check if pool has failed disks (for failed mode) - use all drives for checking
+			poolHasFailed := false
+			if config.FailedMode {
+				for setIdx := range sets {
+					key := fmt.Sprintf("%s:%s", poolIdx, setIdx)
+					drives := allPoolSetDrives[key]
+					if len(drives) == 0 {
+						drives = poolSetDrives[key] // Fallback
+					}
+					for _, d := range drives {
+						if d.State != "ok" {
+							poolHasFailed = true
+							break
+						}
+					}
+					if poolHasFailed {
 						break
 					}
 				}
-				if poolHasFailed {
-					break
-				}
-			}
-			if !poolHasFailed {
-				continue
-			}
-		}
-
-		pager.Printf("%sPool %s:%s\n", Blue, poolIdx, Reset)
-		for setIdx := range sets {
-			key := fmt.Sprintf("%s:%s", poolIdx, setIdx)
-			allDrives := poolSetDrives[key] // All drives (may be filtered by scanning/failed already)
-
-			// For summary mode with failed, we need ALL drives to count properly
-			// So we need to get them from allPoolSetDrives instead
-			var drivesForCounting []DiskInfo
-			if config.SummaryMode && config.FailedMode {
-				// Get all drives from the original map for counting
-				allKey := fmt.Sprintf("%s:%s", poolIdx, setIdx)
-				drivesForCounting = allPoolSetDrives[allKey]
-				if len(drivesForCounting) == 0 {
-					// Fallback to poolSetDrives if not found
-					drivesForCounting = allDrives
-				}
-			} else {
-				drivesForCounting = allDrives
-			}
-
-			drives := allDrives
-
-			if config.ScanningMode && len(drives) == 0 {
-				continue
-			}
-
-			// Filter to only failed disks in failed mode (for summary mode)
-			if config.FailedMode && config.SummaryMode {
-				failedDrives := make([]DiskInfo, 0)
-				for _, d := range drivesForCounting {
-					if d.State != "ok" {
-						failedDrives = append(failedDrives, d)
-					}
-				}
-				if len(failedDrives) == 0 {
+				if !poolHasFailed {
 					continue
 				}
-				// For counting, use the filtered failed drives (to match Python behavior)
-				drivesForCounting = failedDrives
 			}
 
-			if config.SummaryMode {
+			for setIdx := range sets {
+				key := fmt.Sprintf("%s:%s", poolIdx, setIdx)
+				allDrivesForSet := poolSetDrives[key] // All drives (may be filtered by scanning/failed already)
+
+				// For summary mode with failed, we need ALL drives to count properly
+				// So we need to get them from allPoolSetDrives instead
+				var drivesForCounting []DiskInfo
+				if config.FailedMode {
+					// Get all drives from the original map for counting
+					allKey := fmt.Sprintf("%s:%s", poolIdx, setIdx)
+					drivesForCounting = allPoolSetDrives[allKey]
+					if len(drivesForCounting) == 0 {
+						// Fallback to poolSetDrives if not found
+						drivesForCounting = allDrivesForSet
+					}
+				} else {
+					drivesForCounting = allDrivesForSet
+				}
+
+				if config.ScanningMode && len(allDrivesForSet) == 0 {
+					continue
+				}
+
+				// Filter to only failed disks in failed mode (for summary mode)
+				if config.FailedMode {
+					failedDrives := make([]DiskInfo, 0)
+					for _, d := range drivesForCounting {
+						if d.State != "ok" {
+							failedDrives = append(failedDrives, d)
+						}
+					}
+					if len(failedDrives) == 0 {
+						continue
+					}
+					// For counting, use the filtered failed drives (to match Python behavior)
+					drivesForCounting = failedDrives
+				}
+
 				good := 0
 				bad := 0
 				scanning := 0
@@ -1055,53 +1250,176 @@ func printPoolsAndSets(pager *Pager, pools map[string]map[string]interface{}, po
 						avgInodesUsedPct = float64(avgUsedInodes) / float64(avgTotalInodes) * 100
 					}
 
-					spaceUsedColor := Green
-					if avgSpaceUsedPct >= 95 {
-						spaceUsedColor = Red
-					} else if avgSpaceUsedPct >= 80 {
-						spaceUsedColor = Yellow
-					}
-					freeSpaceColor := Green
-					if avgFreeSpacePct <= 5 {
-						freeSpaceColor = Red
-					} else if avgFreeSpacePct <= 20 {
-						freeSpaceColor = Yellow
-					}
-					inodesColor := Green
-					if avgInodesUsedPct >= 95 {
-						inodesColor = Red
-					} else if avgInodesUsedPct >= 80 {
-						inodesColor = Yellow
-					}
-
-					goodText := fmt.Sprintf("%d", good)
-					if good > 0 {
-						goodText = fmt.Sprintf("%s%d%s", Green, good, Reset)
-					}
-					badText := fmt.Sprintf("%d", bad)
-					if bad > 0 {
-						badText = fmt.Sprintf("%s%d%s", Red, bad, Reset)
-					}
-					scanningText := fmt.Sprintf("%d", scanning)
-					if scanning > 0 {
-						scanningText = fmt.Sprintf("%s%d%s", Yellow, scanning, Reset)
-					}
-
-					pager.Printf("  Erasure Set %s: Good disks: %s, Bad disks: %s, Scanning: %s, Avg Space Used: %s%.1f%%%s, Avg Free Space: %s%.1f%%%s, Avg Inodes Used: %s%.1f%%%s\n",
-						setIdx, goodText, badText, scanningText,
-						spaceUsedColor, avgSpaceUsedPct, Reset,
-						freeSpaceColor, avgFreeSpacePct, Reset,
-						inodesColor, avgInodesUsedPct, Reset)
+					poolIdxInt, _ := strconv.Atoi(poolIdx)
+					setIdxInt, _ := strconv.Atoi(setIdx)
+					
+					erasureSetSummaries = append(erasureSetSummaries, ErasureSetSummary{
+						PoolIndex:        poolIdxInt,
+						SetIndex:         setIdxInt,
+						GoodDisks:        good,
+						BadDisks:         bad,
+						ScanningDisks:    scanning,
+						AvgSpaceUsedPct:  avgSpaceUsedPct,
+						AvgFreeSpacePct:  avgFreeSpacePct,
+						AvgInodesUsedPct: avgInodesUsedPct,
+					})
 				}
-			} else {
-				if len(drives) == 0 {
-					continue
-				}
-				pager.Printf("  %sErasure Set %s:%s\n", Blue, setIdx, Reset)
-				printTable(pager, drives, config)
-				pager.Printf("\n")
 			}
 		}
+		
+		// Sort erasure sets by Pool and Erasure Set
+		sort.Slice(erasureSetSummaries, func(i, j int) bool {
+			if erasureSetSummaries[i].PoolIndex != erasureSetSummaries[j].PoolIndex {
+				return erasureSetSummaries[i].PoolIndex < erasureSetSummaries[j].PoolIndex
+			}
+			return erasureSetSummaries[i].SetIndex < erasureSetSummaries[j].SetIndex
+		})
+		
+		// Print Erasure Sets table
+		if len(erasureSetSummaries) > 0 {
+			pager.Printf("%sErasure Sets%s\n", Bold, Reset)
+			
+			headers := []string{"Pool", "Erasure Set", "Good Disks", "Bad Disks", "Scanning", "Avg Space Used", "Avg Free Space", "Avg Inodes Used"}
+			rows := make([][]string, 0, len(erasureSetSummaries))
+			
+			for _, es := range erasureSetSummaries {
+				row := make([]string, len(headers))
+				
+				poolIdxStr := fmt.Sprintf("%d", es.PoolIndex)
+				setIdxStr := fmt.Sprintf("%d", es.SetIndex)
+				
+				goodText := fmt.Sprintf("%d", es.GoodDisks)
+				if es.GoodDisks > 0 {
+					goodText = fmt.Sprintf("%s%d%s", Green, es.GoodDisks, Reset)
+				}
+				
+				badText := fmt.Sprintf("%d", es.BadDisks)
+				if es.BadDisks > 0 {
+					badText = fmt.Sprintf("%s%d%s", Red, es.BadDisks, Reset)
+				}
+				
+				scanningText := fmt.Sprintf("%d", es.ScanningDisks)
+				if es.ScanningDisks > 0 {
+					scanningText = fmt.Sprintf("%s%d%s", Yellow, es.ScanningDisks, Reset)
+				}
+				
+				spaceUsedColor := Green
+				if es.AvgSpaceUsedPct >= 95 {
+					spaceUsedColor = Red
+				} else if es.AvgSpaceUsedPct >= 80 {
+					spaceUsedColor = Yellow
+				}
+				spaceUsedText := fmt.Sprintf("%s%.1f%%%s", spaceUsedColor, es.AvgSpaceUsedPct, Reset)
+				
+				freeSpaceColor := Green
+				if es.AvgFreeSpacePct <= 5 {
+					freeSpaceColor = Red
+				} else if es.AvgFreeSpacePct <= 20 {
+					freeSpaceColor = Yellow
+				}
+				freeSpaceText := fmt.Sprintf("%s%.1f%%%s", freeSpaceColor, es.AvgFreeSpacePct, Reset)
+				
+				inodesColor := Green
+				if es.AvgInodesUsedPct >= 95 {
+					inodesColor = Red
+				} else if es.AvgInodesUsedPct >= 80 {
+					inodesColor = Yellow
+				}
+				inodesText := fmt.Sprintf("%s%.1f%%%s", inodesColor, es.AvgInodesUsedPct, Reset)
+				
+				row[0] = fmt.Sprintf("%s%s%s", Blue, poolIdxStr, Reset)
+				row[1] = fmt.Sprintf("%s%s%s", Blue, setIdxStr, Reset)
+				row[2] = goodText
+				row[3] = badText
+				row[4] = scanningText
+				row[5] = spaceUsedText
+				row[6] = freeSpaceText
+				row[7] = inodesText
+				
+				rows = append(rows, row)
+			}
+			
+			// Calculate column widths
+			widths := make([]int, len(headers))
+			for i, h := range headers {
+				widths[i] = utf8.RuneCountInString(h)
+			}
+			for _, row := range rows {
+				for i, cell := range row {
+					cleanCell := stripANSI(cell)
+					if w := utf8.RuneCountInString(cleanCell); w > widths[i] {
+						widths[i] = w
+					}
+				}
+			}
+			
+			// Print header
+			pager.Printf("  ")
+			for i, h := range headers {
+				pager.Printf("%s", padString(h, widths[i]))
+				if i < len(headers)-1 {
+					pager.Printf("  ")
+				}
+			}
+			pager.Printf("\n")
+			
+			// Print separator
+			pager.Printf("  ")
+			for i, w := range widths {
+				pager.Printf("%s", strings.Repeat("-", w))
+				if i < len(widths)-1 {
+					pager.Printf("  ")
+				}
+			}
+			pager.Printf("\n")
+			
+			// Print rows with spacing
+			for _, row := range rows {
+				pager.Printf("  ")
+				for i, cell := range row {
+					pager.Printf("%s", padString(cell, widths[i]))
+					if i < len(row)-1 {
+						pager.Printf("  ")
+					}
+				}
+				pager.Printf("\n")
+			}
+			pager.Printf("\n")
+		}
+	}
+
+	// Collect all drives for the table (for non-summary mode or if we also want table in summary mode)
+	if !config.SummaryMode {
+		for _, drives := range poolSetDrives {
+			allDrives = append(allDrives, drives...)
+		}
+	}
+
+	// Sort all drives by Pool, Erasure Set, Disk Index
+	sort.Slice(allDrives, func(i, j int) bool {
+		if allDrives[i].PoolIndex != allDrives[j].PoolIndex {
+			return allDrives[i].PoolIndex < allDrives[j].PoolIndex
+		}
+		if allDrives[i].SetIndex != allDrives[j].SetIndex {
+			return allDrives[i].SetIndex < allDrives[j].SetIndex
+		}
+		// Compare DiskIndex - handle interface{} type
+		diStr := fmt.Sprintf("%v", allDrives[i].DiskIndex)
+		djStr := fmt.Sprintf("%v", allDrives[j].DiskIndex)
+		// Try numeric comparison first
+		if di, err1 := strconv.Atoi(diStr); err1 == nil {
+			if dj, err2 := strconv.Atoi(djStr); err2 == nil {
+				return di < dj
+			}
+		}
+		return diStr < djStr
+	})
+
+	// Print single table with all drives
+	if len(allDrives) > 0 {
+		pager.Printf("%sDrives%s\n", Bold, Reset)
+		printTable(pager, allDrives, config)
+		pager.Printf("\n")
 	}
 }
 
@@ -1189,10 +1507,7 @@ func printTable(pager *Pager, drives []DiskInfo, config *Config) {
 		}
 		localText := fmt.Sprintf("%s%s%s", localColor, boolToYesNo(drive.Local), Reset)
 
-		metricsStr := ""
-		if drive.Metrics != nil {
-			metricsStr = fmt.Sprintf("%v", drive.Metrics)
-		}
+		metricsStr := formatMetrics(drive.Metrics)
 
 		row[0] = fmt.Sprintf("%s%s%s", Blue, poolIdxStr, Reset)
 		row[1] = fmt.Sprintf("%s%s%s", Blue, setIdxStr, Reset)
@@ -1230,7 +1545,7 @@ func printTable(pager *Pager, drives []DiskInfo, config *Config) {
 	// Print header
 	pager.Printf("  ")
 	for i, h := range headers {
-		pager.Printf("%-*s", widths[i], h)
+		pager.Printf("%s", padString(h, widths[i]))
 		if i < len(headers)-1 {
 			pager.Printf("  ")
 		}
@@ -1251,7 +1566,7 @@ func printTable(pager *Pager, drives []DiskInfo, config *Config) {
 	for _, row := range rows {
 		pager.Printf("  ")
 		for i, cell := range row {
-			pager.Printf("%-*s", widths[i], cell)
+			pager.Printf("%s", padString(cell, widths[i]))
 			if i < len(row)-1 {
 				pager.Printf("  ")
 			}
@@ -1279,11 +1594,90 @@ func stripANSI(s string) string {
 	return result.String()
 }
 
+// padString pads a string to the specified width, accounting for ANSI codes
+func padString(s string, width int) string {
+	visibleWidth := utf8.RuneCountInString(stripANSI(s))
+	if visibleWidth >= width {
+		return s
+	}
+	padding := width - visibleWidth
+	return s + strings.Repeat(" ", padding)
+}
+
 func boolToYesNo(b bool) string {
 	if b {
 		return "Yes"
 	}
 	return "No"
+}
+
+// naturalLess compares two strings using natural/alphanumeric sorting
+// This ensures that "rack2" comes before "rack10"
+func naturalLess(a, b string) bool {
+	aRunes := []rune(a)
+	bRunes := []rune(b)
+	
+	i, j := 0, 0
+	for i < len(aRunes) && j < len(bRunes) {
+		aRune := aRunes[i]
+		bRune := bRunes[j]
+		
+		// If both are digits, compare as numbers
+		if aRune >= '0' && aRune <= '9' && bRune >= '0' && bRune <= '9' {
+			// Extract full number from both strings
+			aNumStr := ""
+			bNumStr := ""
+			
+			// Extract number from a
+			for i < len(aRunes) && aRunes[i] >= '0' && aRunes[i] <= '9' {
+				aNumStr += string(aRunes[i])
+				i++
+			}
+			
+			// Extract number from b
+			for j < len(bRunes) && bRunes[j] >= '0' && bRunes[j] <= '9' {
+				bNumStr += string(bRunes[j])
+				j++
+			}
+			
+			// Compare as numbers
+			aNum, errA := strconv.Atoi(aNumStr)
+			bNum, errB := strconv.Atoi(bNumStr)
+			
+			if errA == nil && errB == nil {
+				if aNum != bNum {
+					return aNum < bNum
+				}
+				continue
+			}
+			
+			// Fallback to string comparison if conversion fails
+			if aNumStr != bNumStr {
+				return aNumStr < bNumStr
+			}
+			continue
+		}
+		
+		// Compare as runes (case-insensitive)
+		aLower := aRune
+		bLower := bRune
+		if aLower >= 'A' && aLower <= 'Z' {
+			aLower += 32
+		}
+		if bLower >= 'A' && bLower <= 'Z' {
+			bLower += 32
+		}
+		
+		if aLower != bLower {
+			return aLower < bLower
+		}
+		
+		i++
+		j++
+	}
+	
+	// If we've exhausted one string, the shorter one comes first
+	return len(aRunes) < len(bRunes)
 }
 
 func formatInt(n int64) string {
@@ -1299,4 +1693,93 @@ func formatInt(n int64) string {
 		result.WriteRune(r)
 	}
 	return result.String()
+}
+
+// trimDomainData trims domain suffix from endpoint for cleaner display
+func trimDomainData(endpoint, domainString string) string {
+	// Normalize endpoint to extract host (remove scheme, path and port)
+	host := endpoint
+
+	// If endpoint contains a scheme or a path, try parsing it as a URL
+	if strings.Contains(host, "://") {
+		if u, err := url.Parse(host); err == nil {
+			host = u.Host
+		}
+	} else if strings.Contains(host, "/") {
+		// try parsing by adding a scheme so url.Parse treats the first part as host
+		if u, err := url.Parse("http://" + host); err == nil {
+			host = u.Host
+		}
+	}
+
+	// Strip port if present (handles host:port and [ipv6]:port)
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+
+	// If host is an IP address (v4 or v6), return it as-is
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return ip.String()
+	}
+
+	// Fallback to previous behaviour for domain names
+	if domainString == "" {
+		return strings.SplitN(host, ".", 2)[0]
+	}
+	return strings.TrimSuffix(strings.TrimSuffix(host, domainString), ".")
+}
+
+// humanizeDuration humanizes time.Duration output to a meaningful value
+func humanizeDuration(duration time.Duration) string {
+	if duration.Seconds() < 60.0 {
+		return fmt.Sprintf("%d seconds", int64(duration.Seconds()))
+	}
+	if duration.Minutes() < 60.0 {
+		remainingSeconds := math.Mod(duration.Seconds(), 60)
+		return fmt.Sprintf("%d minutes %d seconds", int64(duration.Minutes()), int64(remainingSeconds))
+	}
+	if duration.Hours() < 24.0 {
+		remainingMinutes := math.Mod(duration.Minutes(), 60)
+		remainingSeconds := math.Mod(duration.Seconds(), 60)
+		return fmt.Sprintf("%d hours %d minutes %d seconds",
+			int64(duration.Hours()), int64(remainingMinutes), int64(remainingSeconds))
+	}
+	remainingHours := math.Mod(duration.Hours(), 24)
+	remainingMinutes := math.Mod(duration.Minutes(), 60)
+	remainingSeconds := math.Mod(duration.Seconds(), 60)
+	return fmt.Sprintf("%d days %d hours %d minutes %d seconds",
+		int64(duration.Hours()/24), int64(remainingHours),
+		int64(remainingMinutes), int64(remainingSeconds))
+}
+
+// formatMetrics formats disk metrics in compact format
+func formatMetrics(metrics *madmin.DiskMetrics) string {
+	if metrics == nil {
+		return ""
+	}
+
+	metricBuilder := strings.Builder{}
+	builderFn := func(key string, value uint64) {
+		if value == 0 {
+			return
+		}
+		if metricBuilder.Len() > 0 {
+			metricBuilder.WriteString(", ")
+		}
+		metricBuilder.WriteString(fmt.Sprintf("%s=%d", key, value))
+	}
+
+	builderFn("tokens", uint64(metrics.TotalTokens))
+	builderFn("write", metrics.TotalWrites)
+	builderFn("del", metrics.TotalDeletes)
+	builderFn("waiting", uint64(metrics.TotalWaiting))
+	builderFn("tout", metrics.TotalErrorsTimeout)
+	if metrics.TotalErrorsTimeout != metrics.TotalErrorsAvailability {
+		builderFn("err", metrics.TotalErrorsAvailability)
+	}
+
+	if metricBuilder.Len() > 0 {
+		return fmt.Sprintf("[%s]", metricBuilder.String())
+	}
+	return ""
 }
