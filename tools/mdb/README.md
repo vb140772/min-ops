@@ -15,11 +15,30 @@ A command-line tool for analyzing MinIO cluster diagnostic JSON files. `mdb` pro
 
 ## Installation
 
-### Prerequisites
+### Option 1: Homebrew (Recommended)
 
+```bash
+# Add the tap
+brew tap vb140772/mdb
+
+# Install mdb
+brew install mdb
+```
+
+Alternatively, you can install directly from the tap in one command:
+
+```bash
+brew install vb140772/mdb/mdb
+```
+
+### Option 2: Download Release Binary
+
+Download the latest release from the [GitHub Releases page](https://github.com/vb140772/min-ops/releases).
+
+### Option 3: Build from Source
+
+**Prerequisites:**
 - Go 1.24 or later
-
-### Build from Source
 
 ```bash
 cd tools/mdb

@@ -59,17 +59,21 @@ checksum:
   name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
   algorithm: sha256
 
-# Homebrew (optional - uncomment if you want to publish to Homebrew)
-# brews:
-#   - name: mdb
-#     tap:
-#       owner: vb140772
-#       name: homebrew-tap
-#     homepage: https://github.com/vb140772/min-ops
-#     description: MinIO Debug - analyze MinIO diagnostic JSON files
-#     license: MIT
-#     test: |
-#       system "#{bin}/mdb version"
+# Homebrew
+brews:
+  - name: mdb
+    description: "MinIO Debug - analyze MinIO diagnostic JSON files"
+    homepage: "https://github.com/vb140772/min-ops"
+    license: "MIT"
+    repository:
+      owner: vb140772
+      name: homebrew-mdb
+    directory: Formula
+    commit_author:
+      name: "GitHub Actions"
+      email: "actions@github.com"
+    test: |
+      system "#{bin}/mdb version"
 
 # Scoop (optional - uncomment if you want to publish to Scoop)
 # scoops:
