@@ -34,19 +34,92 @@ make
 
 The binary will be created as `mdb` in the current directory.
 
+### Using GoReleaser (Release Builds)
+
+This project uses [GoReleaser](https://goreleaser.com) for automated cross-platform builds and releases.
+
+**Prerequisites**:
+```bash
+go install github.com/goreleaser/goreleaser/v2@latest
+```
+
+**Available Makefile targets**:
+```bash
+# Test GoReleaser configuration
+make release-test
+
+# Build release artifacts (without publishing)
+make release-build
+
+# Create snapshot release (local, no git tag required)
+make release-snapshot
+
+# Validate configuration
+make release-validate
+
+# Create full release (requires git tag and GITHUB_TOKEN)
+make release
+```
+
+**Creating a release**:
+```bash
+# 1. Create and push a git tag
+git tag -a v1.0.0 -m "Release v1.0.0"
+git push origin v1.0.0
+
+# 2. Set GITHUB_TOKEN and create release
+export GITHUB_TOKEN=your_token_here
+make release
+```
+
+GoReleaser will automatically:
+- Build binaries for multiple platforms (Linux, macOS, Windows on amd64 and arm64)
+- Create archives (tar.gz for Unix, zip for Windows)
+- Generate checksums
+- Create GitHub release with changelog
+
+### Version Information
+
+Version information is automatically embedded at build time:
+- **Version**: Git tag or commit hash (with `-dirty` suffix if there are uncommitted changes)
+- **Commit**: Short git commit hash
+- **Build Date**: UTC timestamp of when the binary was built
+
+**Check version**:
+```bash
+./mdb version
+# or
+./mdb --version
+```
+
+**Example output**:
+```
+mdb version 1.0.0
+commit: 4bf643c
+build date: 2025-12-08T18:52:24Z
+go version: go1.24.11
+```
+
 ## Quick Start
 
-1. **Add a configuration**:
+1. **Check version**:
+   ```bash
+   ./mdb version
+   # or
+   ./mdb --version
+   ```
+
+2. **Add a configuration**:
    ```bash
    ./mdb config add prod /path/to/diagnostic.json
    ```
 
-2. **View cluster summary**:
+3. **View cluster summary**:
    ```bash
    ./mdb show summary
    ```
 
-3. **List all servers**:
+4. **List all servers**:
    ```bash
    ./mdb show servers
    ```

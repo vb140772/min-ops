@@ -1,0 +1,108 @@
+# GoReleaser configuration for mdb
+project_name: mdb
+
+# Release configuration
+release:
+  github:
+    owner: vb140772
+    name: min-ops
+  # Generate changelog from git commits
+  changelog:
+    sort: asc
+    filters:
+      exclude:
+        - "^docs:"
+        - "^test:"
+        - Merge branch
+        - Merge pull request
+
+# Build configuration
+builds:
+  - id: mdb
+    binary: mdb
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X 'main.Version={{.Version}}'
+      - -X 'main.Commit={{.Commit}}'
+      - -X 'main.BuildDate={{.Date}}'
+    env:
+      - CGO_ENABLED=0
+    # Skip invalid targets (e.g., darwin/arm64 for older Go versions)
+    skip: false
+
+# Archive configuration
+archives:
+  - id: default
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - README.md
+      - LICENSE
+
+# Checksums
+checksum:
+  name_template: "{{ .ProjectName }}_{{ .Version }}_checksums.txt"
+  algorithm: sha256
+
+# Homebrew (optional - uncomment if you want to publish to Homebrew)
+# brews:
+#   - name: mdb
+#     tap:
+#       owner: vb140772
+#       name: homebrew-tap
+#     homepage: https://github.com/vb140772/min-ops
+#     description: MinIO Debug - analyze MinIO diagnostic JSON files
+#     license: MIT
+#     test: |
+#       system "#{bin}/mdb version"
+
+# Scoop (optional - uncomment if you want to publish to Scoop)
+# scoops:
+#   - name: mdb
+#     bucket:
+#       owner: vb140772
+#       name: scoop-bucket
+#     homepage: https://github.com/vb140772/min-ops
+#     description: MinIO Debug - analyze MinIO diagnostic JSON files
+#     license: MIT
+
+# Snapcraft (optional - uncomment if you want to publish to Snap)
+# snaps:
+#   - name: mdb
+#     publish: true
+#     summary: MinIO Debug Tool
+#     description: |
+#       A command-line tool for analyzing MinIO cluster diagnostic JSON files.
+#     grade: stable
+#     confinement: strict
+#     apps:
+#       mdb:
+#         command: mdb
+
+# Docker (optional - uncomment if you want to create Docker images)
+# dockers:
+#   - goos: linux
+#     goarch: amd64
+#     image_templates:
+#       - "vb140772/mdb:{{ .Version }}"
+#       - "vb140772/mdb:latest"
+#     dockerfile: Dockerfile
+
+# Announcements (optional - uncomment to announce releases)
+# announce:
+#   twitter:
+#     enabled: false
+#   slack:
+#     enabled: false
+

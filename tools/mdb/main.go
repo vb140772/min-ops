@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,6 +23,13 @@ import (
 	"github.com/minio/cli"
 	"github.com/minio/madmin-go/v3"
 	"github.com/minio/pkg/v3/console"
+)
+
+// Version information - set at build time via ldflags
+var (
+	Version   = "dev"
+	Commit    = "unknown"
+	BuildDate = "unknown"
 )
 
 // ANSI color codes
@@ -217,7 +225,13 @@ func main() {
 	app := cli.NewApp()
 	app.Name = "mdb"
 	app.Usage = "MinIO Debug - analyze MinIO diagnostic JSON files"
+	app.Version = Version
 	app.Commands = []cli.Command{
+		{
+			Name:   "version",
+			Usage:  "Show version information",
+			Action: cmdVersion,
+		},
 		{
 			Name:        "config",
 			Usage:       "Manage configuration files",
@@ -403,9 +417,35 @@ EXAMPLES:
 Use "{{.Name}} [command] --help" for more information about a command.
 `
 
+	// Handle --version flag
+	for _, arg := range os.Args[1:] {
+		if arg == "--version" || arg == "-v" {
+			cmdVersion(nil)
+			return
+		}
+	}
+
 	if err := app.Run(os.Args); err != nil {
 		console.Fatalln(err)
 	}
+}
+
+// cmdVersion handles "mdb version"
+func cmdVersion(ctx *cli.Context) error {
+	fmt.Printf("mdb version %s\n", Version)
+	if Commit != "unknown" && Commit != "" {
+		fmt.Printf("commit: %s\n", Commit)
+	}
+	if BuildDate != "unknown" && BuildDate != "" {
+		fmt.Printf("build date: %s\n", BuildDate)
+	}
+	fmt.Printf("go version: %s\n", getGoVersion())
+	return nil
+}
+
+// getGoVersion returns the Go version used to build the binary
+func getGoVersion() string {
+	return runtime.Version()
 }
 
 // cmdConfigAdd handles "mdb config add <name> <file.json>"
