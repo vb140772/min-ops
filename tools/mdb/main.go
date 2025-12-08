@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -43,7 +44,10 @@ type clusterStruct struct {
 // Config holds command-line configuration
 type Config struct {
 	JSONFile          string
-	SummaryMode       bool
+	ShowSummary       bool
+	ShowServers       bool
+	ShowSets          bool
+	ShowDisks         bool
 	ScanningMode      bool
 	PagerMode         bool
 	FailedMode        bool
@@ -213,31 +217,378 @@ func main() {
 	app := cli.NewApp()
 	app.Name = "mdb"
 	app.Usage = "MinIO Debug - analyze MinIO diagnostic JSON files"
-	app.Action = mainMDB
-	app.Flags = mdbFlags
-	app.CustomAppHelpTemplate = mdbHelpTemplate
+	app.Commands = []cli.Command{
+		{
+			Name:        "config",
+			Usage:       "Manage configuration files",
+			UsageText:   "mdb config [command]",
+			Subcommands: []cli.Command{
+				{
+					Name:      "add",
+					Usage:     "Add a new configuration",
+					UsageText: "mdb config add <name> <file.json>",
+					Action:    cmdConfigAdd,
+				},
+				{
+					Name:      "info",
+					Usage:     "Show current configuration information",
+					UsageText: "mdb config info",
+					Action:    cmdConfigInfo,
+				},
+				{
+					Name:      "list",
+					Usage:     "List all available configurations",
+					UsageText: "mdb config list",
+					Action:    cmdConfigList,
+				},
+				{
+					Name:      "switch",
+					Usage:     "Switch to a different configuration",
+					UsageText: "mdb config switch <name>",
+					Action:    cmdConfigSwitch,
+				},
+				{
+					Name:      "remove",
+					Usage:     "Remove a configuration",
+					UsageText: "mdb config remove <name>",
+					Action:    cmdConfigRemove,
+				},
+			},
+		},
+		{
+			Name:            "show",
+			Usage:           "Show cluster information",
+			UsageText:       "mdb show [command]",
+			Action:          cmdShow,
+			Subcommands: []cli.Command{
+				{
+					Name:   "summary",
+					Usage:  "Show summary only",
+					Action: cmdShowSummary,
+				},
+				{
+					Name:   "sets",
+					Usage:  "Show erasure sets only",
+					Action: cmdShowSets,
+					Flags: []cli.Flag{
+						cli.BoolFlag{
+							Name:  "scanning",
+							Usage: "Show only scanning disks",
+						},
+						cli.BoolFlag{
+							Name:  "failed",
+							Usage: "Show only failed/faulty disks (not 'ok' state)",
+						},
+						cli.StringFlag{
+							Name:  "low-space",
+							Usage: "Filter by free space percentage",
+						},
+						cli.StringFlag{
+							Name:  "min-bad-disks",
+							Usage: "Filter by minimum bad disks",
+						},
+						cli.BoolFlag{
+							Name:  "pager",
+							Usage: "Enable pagination (pauses output after each screen, press space to continue)",
+						},
+						cli.StringFlag{
+							Name:  "trim-domain",
+							Usage: "Trim domain suffix from endpoint names for cleaner display (e.g., '.example.com')",
+						},
+					},
+				},
+				{
+					Name:   "disks",
+					Usage:  "Show disks only",
+					Action: cmdShowDisks,
+					Flags: []cli.Flag{
+						cli.BoolFlag{
+							Name:  "scanning",
+							Usage: "Show only scanning disks",
+						},
+						cli.BoolFlag{
+							Name:  "failed",
+							Usage: "Show only failed/faulty disks (not 'ok' state)",
+						},
+						cli.StringFlag{
+							Name:  "low-space",
+							Usage: "Filter by free space percentage",
+						},
+						cli.BoolFlag{
+							Name:  "pager",
+							Usage: "Enable pagination (pauses output after each screen, press space to continue)",
+						},
+						cli.StringFlag{
+							Name:  "trim-domain",
+							Usage: "Trim domain suffix from endpoint names for cleaner display (e.g., '.example.com')",
+						},
+					},
+				},
+				{
+					Name:   "servers",
+					Usage:  "Show servers only",
+					Action: cmdShowServers,
+					Flags: []cli.Flag{
+						cli.BoolFlag{
+							Name:  "failed",
+							Usage: "Show only offline servers",
+						},
+						cli.BoolFlag{
+							Name:  "pager",
+							Usage: "Enable pagination (pauses output after each screen, press space to continue)",
+						},
+						cli.StringFlag{
+							Name:  "trim-domain",
+							Usage: "Trim domain suffix from endpoint names for cleaner display (e.g., '.example.com')",
+						},
+					},
+				},
+			},
+			Flags: []cli.Flag{
+				cli.BoolFlag{
+					Name:  "pager",
+					Usage: "Enable pagination (pauses output after each screen, press space to continue)",
+				},
+				cli.StringFlag{
+					Name:  "trim-domain",
+					Usage: "Trim domain suffix from endpoint names for cleaner display (e.g., '.example.com')",
+				},
+			},
+		},
+	}
+	app.CustomAppHelpTemplate = `NAME:
+  {{.Name}} - {{.Usage}}
+
+USAGE:
+  {{.Name}} [command]
+
+COMMANDS:
+  {{range .Commands}}{{.Name}}{{with .ShortName}}, {{.ShortName}}{{end}}{{ "\t" }}{{.Usage}}
+  {{end}}
+
+EXAMPLES:
+  1. Add a new configuration:
+     {{.Prompt}} {{.Name}} config add prod file.json
+
+  2. Show current configuration:
+     {{.Prompt}} {{.Name}} config info
+
+  3. List all configurations:
+     {{.Prompt}} {{.Name}} config list
+
+  4. Switch to a different configuration:
+     {{.Prompt}} {{.Name}} config switch prod
+
+  5. Show summary, servers, and erasure sets:
+     {{.Prompt}} {{.Name}} show
+
+  3. Show only summary:
+     {{.Prompt}} {{.Name}} show summary
+
+  4. Show only servers:
+     {{.Prompt}} {{.Name}} show servers
+
+  5. Show only offline servers:
+     {{.Prompt}} {{.Name}} show servers --failed
+
+  6. Show erasure sets with failed disks:
+     {{.Prompt}} {{.Name}} show sets --failed
+
+  7. Show erasure sets with minimum bad disks:
+     {{.Prompt}} {{.Name}} show sets --failed --min-bad-disks 2
+
+  8. Show disks with pagination:
+     {{.Prompt}} {{.Name}} show disks --pager
+
+Use "{{.Name}} [command] --help" for more information about a command.
+`
 
 	if err := app.Run(os.Args); err != nil {
 		console.Fatalln(err)
 	}
 }
 
-func mainMDB(ctx *cli.Context) error {
-	// Check for --help or -h flag anywhere in arguments
-	for _, arg := range os.Args[1:] {
-		if arg == "--help" || arg == "-h" {
-			cli.ShowAppHelp(ctx)
-			return nil
+// cmdConfigAdd handles "mdb config add <name> <file.json>"
+func cmdConfigAdd(ctx *cli.Context) error {
+	if ctx.NArg() < 2 {
+		return fmt.Errorf("usage: mdb config add <name> <file.json>")
+	}
+	
+	name := ctx.Args().Get(0)
+	filePath := ctx.Args().Get(1)
+	
+	if err := saveConfig(name, filePath); err != nil {
+		return err
+	}
+	
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		absPath = filePath
+	}
+	
+	configsData, err := loadConfigsData()
+	if err != nil {
+		return err
+	}
+	
+	if configsData.CurrentConfig == name {
+		fmt.Printf("Added and switched to config '%s': %s\n", name, absPath)
+	} else {
+		fmt.Printf("Added config '%s': %s\n", name, absPath)
+	}
+	return nil
+}
+
+// cmdConfigInfo handles "mdb config info"
+func cmdConfigInfo(ctx *cli.Context) error {
+	currentName, err := getCurrentConfig()
+	if err != nil {
+		return err
+	}
+	
+	filePath, err := loadConfig(currentName)
+	if err != nil {
+		return err
+	}
+	
+	configsData, err := loadConfigsData()
+	if err != nil {
+		return err
+	}
+	
+	var configInfo *ConfigInfo
+	for _, cfg := range configsData.Configs {
+		if cfg.Name == currentName {
+			configInfo = &cfg
+			break
 		}
 	}
 	
-	config := parseFlags(ctx)
-
-	if config.JSONFile == "" {
-		cli.ShowAppHelp(ctx)
-		return fmt.Errorf("JSON file is required")
+	if configInfo == nil {
+		return fmt.Errorf("current config '%s' not found in configs", currentName)
 	}
+	
+	fmt.Printf("Current config: %s\n", currentName)
+	fmt.Printf("  File: %s\n", filePath)
+	fmt.Printf("  Created: %s\n", configInfo.CreatedAt.Format(time.RFC3339))
+	
+	return nil
+}
 
+// cmdConfigList handles "mdb config list"
+func cmdConfigList(ctx *cli.Context) error {
+	configs, currentName, err := listConfigs()
+	if err != nil {
+		return err
+	}
+	
+	if len(configs) == 0 {
+		fmt.Println("No configurations found. Use 'mdb config add <name> <file.json>' to add one.")
+		return nil
+	}
+	
+	// Load deployment IDs for each config
+	type configWithDeploymentID struct {
+		ConfigInfo
+		DeploymentID string
+	}
+	configsWithID := make([]configWithDeploymentID, 0, len(configs))
+	
+	for _, cfg := range configs {
+		deploymentID := "N/A"
+		infoStruct, err := loadJSON(cfg.FilePath)
+		if err == nil && infoStruct != nil && infoStruct.Info.DeploymentID != "" {
+			deploymentID = infoStruct.Info.DeploymentID
+			// Truncate if too long
+			if len(deploymentID) > 36 {
+				deploymentID = deploymentID[:36] + "..."
+			}
+		}
+		configsWithID = append(configsWithID, configWithDeploymentID{
+			ConfigInfo:   cfg,
+			DeploymentID: deploymentID,
+		})
+	}
+	
+	fmt.Printf("%-20s %-38s %-60s %s\n", "NAME", "DEPLOYMENT ID", "FILE", "CREATED")
+	fmt.Println(strings.Repeat("-", 150))
+	
+	for _, cfg := range configsWithID {
+		currentMark := " "
+		if cfg.Name == currentName {
+			currentMark = "*"
+		}
+		// Truncate file path if too long
+		filePath := cfg.FilePath
+		if len(filePath) > 57 {
+			filePath = "..." + filePath[len(filePath)-54:]
+		}
+		fmt.Printf("%s%-19s %-38s %-60s %s\n", currentMark, cfg.Name, cfg.DeploymentID, filePath, cfg.CreatedAt.Format("2006-01-02 15:04:05"))
+	}
+	
+	if currentName != "" {
+		fmt.Printf("\n* = current config\n")
+	}
+	
+	return nil
+}
+
+// cmdConfigSwitch handles "mdb config switch <name>"
+func cmdConfigSwitch(ctx *cli.Context) error {
+	if ctx.NArg() == 0 {
+		return fmt.Errorf("usage: mdb config switch <name>")
+	}
+	
+	name := ctx.Args().Get(0)
+	
+	if err := setCurrentConfig(name); err != nil {
+		return err
+	}
+	
+	filePath, err := loadConfig(name)
+	if err != nil {
+		return err
+	}
+	
+	fmt.Printf("Switched to config '%s': %s\n", name, filePath)
+	return nil
+}
+
+// cmdConfigRemove handles "mdb config remove <name>"
+func cmdConfigRemove(ctx *cli.Context) error {
+	if ctx.NArg() == 0 {
+		return fmt.Errorf("usage: mdb config remove <name>")
+	}
+	
+	name := ctx.Args().Get(0)
+	
+	configsData, err := loadConfigsData()
+	if err != nil {
+		return err
+	}
+	
+	wasCurrent := configsData.CurrentConfig == name
+	
+	if err := removeConfig(name); err != nil {
+		return err
+	}
+	
+	fmt.Printf("Removed config '%s'\n", name)
+	
+	if wasCurrent {
+		configsData, err := loadConfigsData()
+		if err == nil && configsData.CurrentConfig != "" {
+			fmt.Printf("Switched to config '%s'\n", configsData.CurrentConfig)
+		} else if err == nil {
+			fmt.Println("No current config set. Use 'mdb config switch <name>' to set one.")
+		}
+	}
+	
+	return nil
+}
+
+// processAndDisplay processes the JSON data and displays it according to config
+func processAndDisplay(config *Config) error {
 	infoStruct, err := loadJSON(config.JSONFile)
 	if err != nil {
 		return fmt.Errorf("failed to load JSON file '%s': %v", config.JSONFile, err)
@@ -279,12 +630,14 @@ func mainMDB(ctx *cli.Context) error {
 			key := fmt.Sprintf("%d:%d", drive.PoolIndex, drive.SetIndex)
 			allPoolSetDrives[key] = append(allPoolSetDrives[key], drive)
 
-			// Apply filters for display
-			if config.ScanningMode && !drive.Scanning {
-				continue
-			}
-			if config.FailedMode && drive.State == "ok" {
-				continue
+			// Apply filters for display (only for disks/sets views)
+			if config.ShowDisks || config.ShowSets {
+				if config.ScanningMode && !drive.Scanning {
+					continue
+				}
+				if config.FailedMode && drive.State == "ok" {
+					continue
+				}
 			}
 
 			poolSetDrives[key] = append(poolSetDrives[key], drive)
@@ -293,24 +646,45 @@ func mainMDB(ctx *cli.Context) error {
 
 	stats.DeploymentID = infoStruct.Info.DeploymentID
 
-	// Print cluster summary (use all drives for capacity calculation)
-	printClusterSummary(pager, stats, pools, allPoolSetDrives, servers, infoStruct, config)
+	// Print summary if requested
+	if config.ShowSummary {
+		printClusterSummary(pager, stats, pools, allPoolSetDrives, servers, infoStruct, config)
+	}
 
-	// Handle special modes
-	if config.FailedMode && !config.SummaryMode {
+	// Print servers if requested
+	if config.ShowServers {
+		// Filter servers based on --failed flag
+		filteredServers := servers
+		if config.FailedMode {
+			// With --failed: show only offline servers
+			filteredServers = make([]madmin.ServerProperties, 0)
+			for _, server := range servers {
+				if server.State != "online" {
+					filteredServers = append(filteredServers, server)
+				}
+			}
+		}
+		// Without --failed: show all servers (offline will overwrite online during merge)
+		printServerInfo(pager, filteredServers, pools, config.TrimDomain)
+	}
+
+	// Handle special modes for sets/disks
+	if config.ShowDisks && config.FailedMode && !config.ShowSets {
 		printFailedDisksTable(pager, poolSetDrives, config)
 		pager.Show()
 		return nil
 	}
 
-	if config.SummaryMode && config.LowSpaceThreshold != nil {
+	if config.ShowSets && config.LowSpaceThreshold != nil {
 		printLowSpaceErasureSets(pager, pools, poolSetDrives, *config.LowSpaceThreshold, config)
 		pager.Show()
 		return nil
 	}
 
-	// Print pools and erasure sets
-	printPoolsAndSets(pager, pools, poolSetDrives, allPoolSetDrives, config, servers)
+	// Print sets/disks if requested
+	if config.ShowSets || config.ShowDisks {
+		printPoolsAndSets(pager, pools, poolSetDrives, allPoolSetDrives, config, servers)
+	}
 	
 	// Show the pager if enabled
 	pager.Show()
@@ -318,79 +692,83 @@ func mainMDB(ctx *cli.Context) error {
 	return nil
 }
 
-var mdbFlags = []cli.Flag{
-	cli.BoolFlag{
-		Name:  "summary",
-		Usage: "Display summary view",
-	},
-	cli.BoolFlag{
-		Name:  "scanning",
-		Usage: "Show only scanning disks",
-	},
-	cli.BoolFlag{
-		Name:  "pager",
-		Usage: "Enable pagination (pauses output after each screen, press space to continue)",
-	},
-	cli.BoolFlag{
-		Name:  "failed",
-		Usage: "Show only failed/faulty disks (not 'ok' state)",
-	},
-	cli.StringFlag{
-		Name:  "low-space",
-		Usage: "Filter by free space percentage (requires --summary)",
-	},
-	cli.StringFlag{
-		Name:  "min-bad-disks",
-		Usage: "Filter by minimum bad disks (requires --summary --failed)",
-	},
-	cli.StringFlag{
-		Name:  "trim-domain",
-		Usage: "Trim domain suffix from endpoint names for cleaner display (e.g., '.example.com')",
-	},
+// cmdShow handles "mdb show" (default - shows summary, servers, and erasure sets)
+func cmdShow(ctx *cli.Context) error {
+	config, err := parseShowFlags(ctx, true, true, true, false)
+	if err != nil {
+		return err
+	}
+	return processAndDisplay(config)
 }
 
-var mdbHelpTemplate = `NAME:
-  {{.Name}} - {{.Usage}}
+// cmdShowSummary handles "mdb show summary"
+func cmdShowSummary(ctx *cli.Context) error {
+	config, err := parseShowFlags(ctx, true, false, false, false)
+	if err != nil {
+		return err
+	}
+	return processAndDisplay(config)
+}
 
-USAGE:
-  {{.Name}} [FLAGS] JSON_FILE
+// cmdShowSets handles "mdb show sets"
+func cmdShowSets(ctx *cli.Context) error {
+	config, err := parseShowFlags(ctx, false, false, true, false)
+	if err != nil {
+		return err
+	}
+	return processAndDisplay(config)
+}
 
-FLAGS:
-  {{range .VisibleFlags}}{{.}}
-  {{end}}
-EXAMPLES:
-  1. Display summary view of MinIO cluster.
-     {{.Prompt}} {{.HelpName}} prod.json --summary
+// cmdShowDisks handles "mdb show disks"
+func cmdShowDisks(ctx *cli.Context) error {
+	config, err := parseShowFlags(ctx, false, false, false, true)
+	if err != nil {
+		return err
+	}
+	return processAndDisplay(config)
+}
 
-  2. Show only scanning disks.
-     {{.Prompt}} {{.HelpName}} prod.json --scanning
+// cmdShowServers handles "mdb show servers"
+func cmdShowServers(ctx *cli.Context) error {
+	config, err := parseShowFlags(ctx, false, true, false, false)
+	if err != nil {
+		return err
+	}
+	return processAndDisplay(config)
+}
 
-  3. Show erasure sets with low free space.
-     {{.Prompt}} {{.HelpName}} prod.json --summary --low-space=10
 
-  4. Enable pagination for long output.
-     {{.Prompt}} {{.HelpName}} prod.json --pager
-
-  5. Show only failed disks.
-     {{.Prompt}} {{.HelpName}} prod.json --failed
-
-  6. Show summary of failed disks.
-     {{.Prompt}} {{.HelpName}} prod.json --summary --failed
-
-  7. Filter erasure sets with minimum bad disks.
-     {{.Prompt}} {{.HelpName}} prod.json --summary --failed --min-bad-disks=2
-
-NOTES:
-  - --low-space requires --summary mode
-  - --min-bad-disks requires --summary --failed mode
-  - --pager pauses output after each screen (press space to continue, 'q' to quit)
-`
-
-func parseFlags(ctx *cli.Context) *Config {
+// parseShowFlags parses flags for show commands
+func parseShowFlags(ctx *cli.Context, showSummary, showServers, showSets, showDisks bool) (*Config, error) {
 	config := &Config{}
-
-	// Use cli library's built-in parsing - it handles argument order automatically
-	config.SummaryMode = ctx.Bool("summary")
+	
+	// Load JSON file from current config - reload configsData fresh each time
+	currentName, err := getCurrentConfig()
+	if err != nil {
+		return nil, err
+	}
+	
+	// Double-check that we have the right current config by reloading
+	configsData, err := loadConfigsData()
+	if err != nil {
+		return nil, fmt.Errorf("failed to load configs data: %v", err)
+	}
+	
+	if configsData.CurrentConfig != currentName {
+		// Current config changed, use the one from configsData
+		currentName = configsData.CurrentConfig
+	}
+	
+	jsonFile, err := loadConfig(currentName)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load config '%s': %v", currentName, err)
+	}
+	config.JSONFile = jsonFile
+	
+	config.ShowSummary = showSummary
+	config.ShowServers = showServers
+	config.ShowSets = showSets
+	config.ShowDisks = showDisks
 	config.ScanningMode = ctx.Bool("scanning")
 	config.PagerMode = ctx.Bool("pager")
 	config.FailedMode = ctx.Bool("failed")
@@ -408,20 +786,265 @@ func parseFlags(ctx *cli.Context) *Config {
 		}
 	}
 	
-	// Get JSON file from positional arguments
-	if ctx.NArg() >= 1 {
-		config.JSONFile = ctx.Args().Get(0)
+	// Validate mutually exclusive flags
+	if config.ScanningMode && config.FailedMode {
+		return nil, fmt.Errorf("--failed and --scanning cannot be used together")
 	}
+	
+	// Validate flag usage
+	if config.LowSpaceThreshold != nil && !showSets && !showDisks {
+		return nil, fmt.Errorf("--low-space can only be used with 'show sets' or 'show disks'")
+	}
+	if config.MinBadDisks != nil && !showSets {
+		return nil, fmt.Errorf("--min-bad-disks can only be used with 'show sets'")
+	}
+	if config.ScanningMode && !showSets && !showDisks {
+		return nil, fmt.Errorf("--scanning can only be used with 'show sets' or 'show disks'")
+	}
+	
+	return config, nil
+}
 
-	// Validate flag dependencies
-	if config.LowSpaceThreshold != nil && !config.SummaryMode {
-		console.Fatalln(fmt.Errorf("--low-space option requires --summary mode"))
-	}
-	if config.MinBadDisks != nil && (!config.SummaryMode || !config.FailedMode) {
-		console.Fatalln(fmt.Errorf("--min-bad-disks option requires --summary --failed mode"))
-	}
+// ConfigInfo represents a stored configuration
+type ConfigInfo struct {
+	Name      string    `json:"name"`
+	FilePath  string    `json:"filePath"`
+	CreatedAt time.Time `json:"createdAt"`
+}
 
-	return config
+// ConfigsData holds all configurations and current active config
+type ConfigsData struct {
+	Configs      []ConfigInfo `json:"configs"`
+	CurrentConfig string      `json:"currentConfig"`
+}
+
+// Config file management functions
+func getConfigDir() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %v", err)
+	}
+	configDir := filepath.Join(homeDir, ".mdb", "configs")
+	// Create configs directory if it doesn't exist
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create config directory: %v", err)
+	}
+	return configDir, nil
+}
+
+func getConfigsFile() (string, error) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to get home directory: %v", err)
+	}
+	configDir := filepath.Join(homeDir, ".mdb")
+	// Create .mdb directory if it doesn't exist
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create config directory: %v", err)
+	}
+	return filepath.Join(configDir, "configs.json"), nil
+}
+
+func loadConfigsData() (*ConfigsData, error) {
+	configsPath, err := getConfigsFile()
+	if err != nil {
+		return nil, err
+	}
+	
+	data := &ConfigsData{
+		Configs:      []ConfigInfo{},
+		CurrentConfig: "",
+	}
+	
+	fileData, err := os.ReadFile(configsPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Return empty configs data if file doesn't exist
+			return data, nil
+		}
+		return nil, fmt.Errorf("failed to read configs file: %v", err)
+	}
+	
+	if err := json.Unmarshal(fileData, data); err != nil {
+		return nil, fmt.Errorf("failed to parse configs file: %v", err)
+	}
+	
+	return data, nil
+}
+
+func saveConfigsData(data *ConfigsData) error {
+	configsPath, err := getConfigsFile()
+	if err != nil {
+		return err
+	}
+	
+	fileData, err := json.MarshalIndent(data, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal configs data: %v", err)
+	}
+	
+	if err := os.WriteFile(configsPath, fileData, 0644); err != nil {
+		return fmt.Errorf("failed to write configs file: %v", err)
+	}
+	
+	return nil
+}
+
+func saveConfig(name, filePath string) error {
+	// Validate that the file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return fmt.Errorf("file '%s' does not exist", filePath)
+	}
+	
+	// Resolve absolute path
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve absolute path: %v", err)
+	}
+	
+	// Load existing configs
+	configsData, err := loadConfigsData()
+	if err != nil {
+		return err
+	}
+	
+	// Check if config with this name already exists
+	for i, cfg := range configsData.Configs {
+		if cfg.Name == name {
+			// Update existing config
+			configsData.Configs[i].FilePath = absPath
+			configsData.Configs[i].CreatedAt = time.Now()
+			if err := saveConfigsData(configsData); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+	
+	// Add new config
+	newConfig := ConfigInfo{
+		Name:      name,
+		FilePath:  absPath,
+		CreatedAt: time.Now(),
+	}
+	configsData.Configs = append(configsData.Configs, newConfig)
+	
+	// If this is the first config, set it as current
+	if configsData.CurrentConfig == "" {
+		configsData.CurrentConfig = name
+	}
+	
+	if err := saveConfigsData(configsData); err != nil {
+		return err
+	}
+	
+	return nil
+}
+
+func loadConfig(name string) (string, error) {
+	configsData, err := loadConfigsData()
+	if err != nil {
+		return "", err
+	}
+	
+	for _, cfg := range configsData.Configs {
+		if cfg.Name == name {
+			// Validate that the file still exists
+			if _, err := os.Stat(cfg.FilePath); os.IsNotExist(err) {
+				return "", fmt.Errorf("config '%s' file '%s' does not exist", name, cfg.FilePath)
+			}
+			return cfg.FilePath, nil
+		}
+	}
+	
+	return "", fmt.Errorf("config '%s' not found", name)
+}
+
+func getCurrentConfig() (string, error) {
+	configsData, err := loadConfigsData()
+	if err != nil {
+		return "", err
+	}
+	
+	if configsData.CurrentConfig == "" {
+		return "", fmt.Errorf("no current config set. Use 'mdb config add <name> <file.json>' to add a config")
+	}
+	
+	return configsData.CurrentConfig, nil
+}
+
+func setCurrentConfig(name string) error {
+	configsData, err := loadConfigsData()
+	if err != nil {
+		return err
+	}
+	
+	// Verify config exists
+	found := false
+	for _, cfg := range configsData.Configs {
+		if cfg.Name == name {
+			found = true
+			break
+		}
+	}
+	
+	if !found {
+		return fmt.Errorf("config '%s' not found", name)
+	}
+	
+	configsData.CurrentConfig = name
+	if err := saveConfigsData(configsData); err != nil {
+		return err
+	}
+	
+	return nil
+}
+
+func listConfigs() ([]ConfigInfo, string, error) {
+	configsData, err := loadConfigsData()
+	if err != nil {
+		return nil, "", err
+	}
+	
+	return configsData.Configs, configsData.CurrentConfig, nil
+}
+
+func removeConfig(name string) error {
+	configsData, err := loadConfigsData()
+	if err != nil {
+		return err
+	}
+	
+	// Find and remove config
+	newConfigs := []ConfigInfo{}
+	found := false
+	for _, cfg := range configsData.Configs {
+		if cfg.Name == name {
+			found = true
+			continue
+		}
+		newConfigs = append(newConfigs, cfg)
+	}
+	
+	if !found {
+		return fmt.Errorf("config '%s' not found", name)
+	}
+	
+	// If removing current config, clear it
+	if configsData.CurrentConfig == name {
+		configsData.CurrentConfig = ""
+		if len(newConfigs) > 0 {
+			// Set first remaining config as current
+			configsData.CurrentConfig = newConfigs[0].Name
+		}
+	}
+	
+	configsData.Configs = newConfigs
+	if err := saveConfigsData(configsData); err != nil {
+		return err
+	}
+	
+	return nil
 }
 
 func loadJSON(filename string) (*clusterStruct, error) {
@@ -936,10 +1559,18 @@ func printServerInfo(pager *Pager, servers []madmin.ServerProperties, pools map[
 				mergedPools = append(mergedPools, p)
 			}
 			sort.Ints(mergedPools)
+			
+			// When merging, prefer offline state over online (offline is more critical)
+			// If current server is offline, use it; otherwise keep existing
+			preferredServer := existing.server
+			if server.State == "offline" || (existing.server.State == "online" && server.State != "online") {
+				preferredServer = server
+			}
+			
 			serversData[endpointName] = struct {
 				server  madmin.ServerProperties
 				pools   []int
-			}{server: existing.server, pools: mergedPools}
+			}{server: preferredServer, pools: mergedPools}
 		} else {
 			serversData[endpointName] = struct {
 				server  madmin.ServerProperties
@@ -1069,16 +1700,11 @@ func printServerInfo(pager *Pager, servers []madmin.ServerProperties, pools map[
 }
 
 func printPoolsAndSets(pager *Pager, pools map[string]map[string]interface{}, poolSetDrives map[string][]DiskInfo, allPoolSetDrives map[string][]DiskInfo, config *Config, servers []madmin.ServerProperties) {
-	// Print server information once for all pools (skip if failed mode is enabled)
-	if !config.FailedMode {
-		printServerInfo(pager, servers, pools, config.TrimDomain)
-	}
-
 	// Collect all drives from all pools and erasure sets
 	allDrives := make([]DiskInfo, 0)
 	
-	// For summary mode, collect erasure set statistics and display in table format
-	if config.SummaryMode {
+	// For show sets, collect erasure set statistics and display in table format
+	if config.ShowSets {
 		type ErasureSetSummary struct {
 			PoolIndex       int
 			SetIndex        int
@@ -1345,11 +1971,16 @@ func printPoolsAndSets(pager *Pager, pools map[string]map[string]interface{}, po
 		}
 	}
 
-	// Collect all drives for the table (for non-summary mode or if we also want table in summary mode)
-	if !config.SummaryMode {
+	// Collect all drives for the table (for show disks mode)
+	if config.ShowDisks {
 		for _, drives := range poolSetDrives {
 			allDrives = append(allDrives, drives...)
 		}
+	}
+
+	// Only print drives table if ShowDisks is true
+	if !config.ShowDisks {
+		return
 	}
 
 	// Sort all drives by Pool, Erasure Set, Disk Index
@@ -1374,7 +2005,13 @@ func printPoolsAndSets(pager *Pager, pools map[string]map[string]interface{}, po
 
 	// Print single table with all drives
 	if len(allDrives) > 0 {
+		// Only print "Drives" header if ShowDisks is true and not already showing sets
+	if config.ShowDisks && !config.ShowSets {
 		pager.Printf("%sDrives%s\n", Bold, Reset)
+	} else if config.ShowDisks && config.ShowSets {
+		// When both ShowDisks and ShowSets are true, we don't need a separate header
+		pager.Printf("%sDrives%s\n", Bold, Reset)
+	}
 		printTable(pager, allDrives, config)
 		pager.Printf("\n")
 	}
