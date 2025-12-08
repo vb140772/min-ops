@@ -389,103 +389,27 @@ NOTES:
 func parseFlags(ctx *cli.Context) *Config {
 	config := &Config{}
 
-	// Get all arguments manually to handle flags that come after positional args
-	// This handles both: mdb --pager file.json and mdb file.json --pager
-	allArgs := os.Args[1:] // Skip program name
+	// Use cli library's built-in parsing - it handles argument order automatically
+	config.SummaryMode = ctx.Bool("summary")
+	config.ScanningMode = ctx.Bool("scanning")
+	config.PagerMode = ctx.Bool("pager")
+	config.FailedMode = ctx.Bool("failed")
+	config.TrimDomain = ctx.String("trim-domain")
 	
-	// Track which arguments are flag values (to skip when finding JSON file)
-	flagValueIndices := make(map[int]bool)
-	
-	// First pass: identify flag values
-	for i, arg := range allArgs {
-		// Check if this argument is a value for a flag that expects a value
-		if i > 0 && !strings.HasPrefix(arg, "-") {
-			prevArg := allArgs[i-1]
-			if prevArg == "--trim-domain" || prevArg == "--low-space" || prevArg == "--min-bad-disks" {
-				flagValueIndices[i] = true
-			}
+	// Parse string flags that need conversion
+	if ctx.String("low-space") != "" {
+		if val, err := strconv.ParseFloat(ctx.String("low-space"), 64); err == nil {
+			config.LowSpaceThreshold = &val
+		}
+	}
+	if ctx.String("min-bad-disks") != "" {
+		if val, err := strconv.Atoi(ctx.String("min-bad-disks")); err == nil && val >= 0 {
+			config.MinBadDisks = &val
 		}
 	}
 	
-	// Find JSON file (first non-flag argument that isn't a flag value)
-	var jsonFile string
-	for i, arg := range allArgs {
-		if !strings.HasPrefix(arg, "-") && arg != "" && !flagValueIndices[i] {
-			jsonFile = arg
-			break
-		}
-	}
-	
-	// Manually parse all flags from command line
-	// This ensures flags work whether they come before or after the file
-	// Handles both --flag=value and --flag value formats
-	for i, arg := range allArgs {
-		if arg == "--pager" {
-			config.PagerMode = true
-		}
-		if arg == "--summary" {
-			config.SummaryMode = true
-		}
-		if arg == "--scanning" {
-			config.ScanningMode = true
-		}
-		if arg == "--failed" {
-			config.FailedMode = true
-		}
-		
-		// Handle --trim-domain=value or --trim-domain value
-		if arg == "--trim-domain" && i+1 < len(allArgs) && !strings.HasPrefix(allArgs[i+1], "-") {
-			config.TrimDomain = allArgs[i+1]
-		} else if strings.HasPrefix(arg, "--trim-domain=") {
-			parts := strings.SplitN(arg, "=", 2)
-			if len(parts) == 2 {
-				config.TrimDomain = parts[1]
-			}
-		}
-		
-		// Handle --low-space=value or --low-space value
-		if arg == "--low-space" && i+1 < len(allArgs) && !strings.HasPrefix(allArgs[i+1], "-") {
-			if val, err := strconv.ParseFloat(allArgs[i+1], 64); err == nil {
-				config.LowSpaceThreshold = &val
-			}
-		} else if strings.HasPrefix(arg, "--low-space=") {
-			parts := strings.SplitN(arg, "=", 2)
-			if len(parts) == 2 {
-				if val, err := strconv.ParseFloat(parts[1], 64); err == nil {
-					config.LowSpaceThreshold = &val
-				}
-			}
-		}
-		
-		// Handle --min-bad-disks=value or --min-bad-disks value
-		if arg == "--min-bad-disks" && i+1 < len(allArgs) && !strings.HasPrefix(allArgs[i+1], "-") {
-			if val, err := strconv.Atoi(allArgs[i+1]); err == nil && val >= 0 {
-				config.MinBadDisks = &val
-			}
-		} else if strings.HasPrefix(arg, "--min-bad-disks=") {
-			parts := strings.SplitN(arg, "=", 2)
-			if len(parts) == 2 {
-				if val, err := strconv.Atoi(parts[1]); err == nil && val >= 0 {
-					config.MinBadDisks = &val
-				}
-			}
-		}
-	}
-	
-	// Also check context (in case flags were parsed before positional args)
-	// Use OR to combine with manually parsed flags
-	config.SummaryMode = config.SummaryMode || ctx.Bool("summary")
-	config.ScanningMode = config.ScanningMode || ctx.Bool("scanning")
-	config.PagerMode = config.PagerMode || ctx.Bool("pager")
-	config.FailedMode = config.FailedMode || ctx.Bool("failed")
-	if config.TrimDomain == "" {
-		config.TrimDomain = ctx.String("trim-domain")
-	}
-	
-	config.JSONFile = jsonFile
-	
-	// Use ctx.Args() as fallback if manual parsing didn't find the file
-	if config.JSONFile == "" && ctx.NArg() >= 1 {
+	// Get JSON file from positional arguments
+	if ctx.NArg() >= 1 {
 		config.JSONFile = ctx.Args().Get(0)
 	}
 
