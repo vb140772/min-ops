@@ -78,14 +78,10 @@ brews:
       bin.install "mdb"
     post_install: |
       # Install bash completion
-      mkdir -p "#{bash_completion}/mdb"
-      "#{bin}/mdb" completion bash > "#{bash_completion}/mdb"
-      chmod 0644 "#{bash_completion}/mdb"
+      bash_completion.install_completions("#{bin}/mdb", "bash")
       
       # Install zsh completion
-      mkdir -p "#{zsh_completion}"
-      "#{bin}/mdb" completion zsh > "#{zsh_completion}/_mdb"
-      chmod 0644 "#{zsh_completion}/_mdb"
+      zsh_completion.install_completions("#{bin}/mdb", "zsh")
 
 # Scoop (optional - uncomment if you want to publish to Scoop)
 # scoops:
