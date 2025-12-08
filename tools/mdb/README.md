@@ -53,6 +53,87 @@ make
 
 The binary will be created as `mdb` in the current directory.
 
+## Shell Completion
+
+The `mdb` tool supports shell completion for bash and zsh, making it easier to use the command-line interface.
+
+### Installation
+
+#### Option 1: Homebrew (Automatic)
+
+If you installed `mdb` via Homebrew, completion scripts are automatically installed and available in your shell.
+
+#### Option 2: Manual Installation
+
+**Bash:**
+
+For current session:
+```bash
+source <(mdb completion bash)
+```
+
+To install permanently:
+```bash
+# Linux
+sudo mdb completion bash > /etc/bash_completion.d/mdb
+
+# macOS (with Homebrew bash completion)
+mdb completion bash > $(brew --prefix)/etc/bash_completion.d/mdb
+
+# Or add to ~/.bashrc
+echo 'source <(mdb completion bash)' >> ~/.bashrc
+```
+
+**Zsh:**
+
+For current session:
+```bash
+source <(mdb completion zsh)
+```
+
+To install permanently:
+```bash
+# Add to ~/.zshrc
+echo 'source <(mdb completion zsh)' >> ~/.zshrc
+
+# Or install to zsh completion directory
+mkdir -p ~/.zsh/completions
+mdb completion zsh > ~/.zsh/completions/_mdb
+echo 'fpath=(~/.zsh/completions $fpath)' >> ~/.zshrc
+autoload -U compinit && compinit
+```
+
+### Features
+
+- **Command Completion**: Tab completion for all commands (`version`, `config`, `show`, `completion`)
+- **Subcommand Completion**: Tab completion for subcommands (`config add/info/list/switch/remove`, `show summary/sets/disks/servers`)
+- **Flag Completion**: Tab completion for all flags (`--pager`, `--trim-domain`, `--failed`, `--scanning`, `--low-space`, `--min-bad-disks`)
+- **Dynamic Completion**: Config names are automatically completed for `config switch` and `config remove` commands
+
+### Examples
+
+```bash
+# Complete commands
+mdb <TAB>
+# Shows: completion  config  show  version
+
+# Complete config subcommands
+mdb config <TAB>
+# Shows: add  info  list  remove  switch
+
+# Dynamic completion for config names
+mdb config switch <TAB>
+# Shows all available configuration names from ~/.mdb/configs.json
+
+# Complete show subcommands
+mdb show <TAB>
+# Shows: disks  servers  sets  summary
+
+# Complete flags
+mdb show sets --<TAB>
+# Shows: --failed  --low-space  --min-bad-disks  --pager  --scanning  --trim-domain
+```
+
 ### Using GoReleaser (Release Builds)
 
 This project uses [GoReleaser](https://goreleaser.com) for automated cross-platform builds and releases.

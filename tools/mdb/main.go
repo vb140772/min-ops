@@ -233,6 +233,23 @@ func main() {
 			Action: cmdVersion,
 		},
 		{
+			Name:        "completion",
+			Usage:       "Generate shell completion scripts",
+			UsageText:   "mdb completion [shell]",
+			Subcommands: []cli.Command{
+				{
+					Name:   "bash",
+					Usage:  "Generate bash completion script",
+					Action: cmdCompletionBash,
+				},
+				{
+					Name:   "zsh",
+					Usage:  "Generate zsh completion script",
+					Action: cmdCompletionZsh,
+				},
+			},
+		},
+		{
 			Name:        "config",
 			Usage:       "Manage configuration files",
 			UsageText:   "mdb config [command]",
@@ -425,6 +442,12 @@ Use "{{.Name}} [command] --help" for more information about a command.
 		}
 	}
 
+	// Handle __complete for dynamic completion
+	if len(os.Args) > 1 && os.Args[1] == "__complete" {
+		handleCompletion(os.Args[2:])
+		return
+	}
+
 	if err := app.Run(os.Args); err != nil {
 		console.Fatalln(err)
 	}
@@ -441,6 +464,51 @@ func cmdVersion(ctx *cli.Context) error {
 	}
 	fmt.Printf("go version: %s\n", getGoVersion())
 	return nil
+}
+
+// cmdCompletionBash handles "mdb completion bash"
+func cmdCompletionBash(ctx *cli.Context) error {
+	fmt.Print(generateBashCompletion())
+	return nil
+}
+
+// cmdCompletionZsh handles "mdb completion zsh"
+func cmdCompletionZsh(ctx *cli.Context) error {
+	fmt.Print(generateZshCompletion())
+	return nil
+}
+
+// handleCompletion handles "__complete" command for dynamic completion
+func handleCompletion(args []string) {
+	if len(args) == 0 {
+		return
+	}
+
+	command := args[0]
+	
+	// Handle config subcommands that need dynamic completion
+	if command == "config" && len(args) >= 2 {
+		subcommand := args[1]
+		wordToComplete := ""
+		if len(args) >= 3 {
+			wordToComplete = args[2]
+		}
+
+		// For switch and remove, complete with config names
+		if subcommand == "switch" || subcommand == "remove" {
+			configs, _, err := listConfigs()
+			if err == nil {
+				for _, cfg := range configs {
+					if wordToComplete == "" || strings.HasPrefix(cfg.Name, wordToComplete) {
+						fmt.Println(cfg.Name)
+					}
+				}
+			}
+			return
+		}
+	}
+
+	// Default: no completions
 }
 
 // getGoVersion returns the Go version used to build the binary
@@ -2384,6 +2452,188 @@ func humanizeDuration(duration time.Duration) string {
 	return fmt.Sprintf("%d days %d hours %d minutes %d seconds",
 		int64(duration.Hours()/24), int64(remainingHours),
 		int64(remainingMinutes), int64(remainingSeconds))
+}
+
+// generateBashCompletion generates bash completion script
+func generateBashCompletion() string {
+	return `# bash completion for mdb
+
+_mdb() {
+    local cur prev words cword
+    COMPREPLY=()
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+    words=("${COMP_WORDS[@]}")
+
+    case "$prev" in
+        mdb)
+            COMPREPLY=($(compgen -W "version completion config show" -- "$cur"))
+            return 0
+            ;;
+        config)
+            COMPREPLY=($(compgen -W "add info list switch remove" -- "$cur"))
+            return 0
+            ;;
+        show)
+            COMPREPLY=($(compgen -W "summary sets disks servers" -- "$cur"))
+            return 0
+            ;;
+        completion)
+            COMPREPLY=($(compgen -W "bash zsh" -- "$cur"))
+            return 0
+            ;;
+        switch|remove)
+            # Dynamic completion for config names
+            if [ "${COMP_WORDS[COMP_CWORD-2]}" = "config" ]; then
+                local configs
+                configs=$(mdb __complete config "$prev" "$cur" 2>/dev/null)
+                if [ $? -eq 0 ] && [ -n "$configs" ]; then
+                    COMPREPLY=($(compgen -W "$configs" -- "$cur"))
+                fi
+            fi
+            return 0
+            ;;
+        --low-space|--min-bad-disks|--trim-domain)
+            return 0
+            ;;
+    esac
+
+    # Complete flags
+    if [[ "$cur" == -* ]]; then
+        local flags=""
+        case "${words[1]}" in
+            show)
+                flags="--pager --trim-domain"
+                if [ ${#words[@]} -ge 3 ]; then
+                    case "${words[2]}" in
+                        sets)
+                            flags="$flags --scanning --failed --low-space --min-bad-disks"
+                            ;;
+                        disks)
+                            flags="$flags --scanning --failed --low-space"
+                            ;;
+                        servers)
+                            flags="$flags --failed"
+                            ;;
+                    esac
+                fi
+                ;;
+        esac
+        if [ -n "$flags" ]; then
+            COMPREPLY=($(compgen -W "$flags" -- "$cur"))
+        fi
+        return 0
+    fi
+
+    return 0
+}
+
+complete -F _mdb mdb
+`
+}
+
+// generateZshCompletion generates zsh completion script
+func generateZshCompletion() string {
+	return `#compdef mdb
+
+_mdb() {
+    local -a commands subcommands flags
+
+    _arguments -C \
+        '1: :->command' \
+        '2: :->subcommand' \
+        '*: :->args' \
+        && return 0
+
+    case $state in
+        command)
+            commands=(
+                'version:Show version information'
+                'completion:Generate shell completion scripts'
+                'config:Manage configuration files'
+                'show:Show cluster information'
+            )
+            _describe 'commands' commands
+            ;;
+        subcommand)
+            case $words[2] in
+                completion)
+                    subcommands=(
+                        'bash:Generate bash completion script'
+                        'zsh:Generate zsh completion script'
+                    )
+                    _describe 'completion shells' subcommands
+                    ;;
+                config)
+                    subcommands=(
+                        'add:Add a new configuration'
+                        'info:Show current configuration information'
+                        'list:List all available configurations'
+                        'switch:Switch to a different configuration'
+                        'remove:Remove a configuration'
+                    )
+                    _describe 'config commands' subcommands
+                    ;;
+                show)
+                    subcommands=(
+                        'summary:Show summary only'
+                        'sets:Show erasure sets only'
+                        'disks:Show disks only'
+                        'servers:Show servers only'
+                    )
+                    _describe 'show commands' subcommands
+                    ;;
+            esac
+            ;;
+        args)
+            # Dynamic completion for config names
+            if [[ $words[2] == "config" ]] && [[ $words[3] == (switch|remove) ]]; then
+                local configs
+                configs=(${(f)"$(mdb __complete config $words[3] "" 2>/dev/null)"})
+                if [[ $? -eq 0 ]] && [[ -n "$configs" ]]; then
+                    _describe 'config names' configs
+                fi
+                return 0
+            fi
+
+            # Flag completion
+            case $words[2] in
+                show)
+                    flags=(
+                        '--pager:Enable pagination'
+                        '--trim-domain:Trim domain suffix from endpoint names'
+                    )
+                    case $words[3] in
+                        sets)
+                            flags+=(
+                                '--scanning:Show only scanning disks'
+                                '--failed:Show only failed/faulty disks'
+                                '--low-space:Filter by free space percentage'
+                                '--min-bad-disks:Filter by minimum bad disks'
+                            )
+                            ;;
+                        disks)
+                            flags+=(
+                                '--scanning:Show only scanning disks'
+                                '--failed:Show only failed/faulty disks'
+                                '--low-space:Filter by free space percentage'
+                            )
+                            ;;
+                        servers)
+                            flags+=(
+                                '--failed:Show only offline servers'
+                            )
+                            ;;
+                    esac
+                    _describe 'flags' flags
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_mdb "$@"
+`
 }
 
 // formatMetrics formats disk metrics in compact format

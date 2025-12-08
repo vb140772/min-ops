@@ -42,6 +42,17 @@ builds:
     # Skip invalid targets (e.g., darwin/arm64 for older Go versions)
     skip: false
 
+# Completion scripts
+completions:
+  - name: bash
+    cmd: "mdb completion bash"
+    shells: [bash]
+    description: "Bash completion for mdb"
+  - name: zsh
+    cmd: "mdb completion zsh"
+    shells: [zsh]
+    description: "Zsh completion for mdb"
+
 # Archive configuration
 archives:
   - id: default
@@ -52,6 +63,7 @@ archives:
     # Only include files that exist (paths relative to workdir)
     files:
       - README.md
+      - completions/**/*
     allow_different_binary_count: true
 
 # Checksums
@@ -74,6 +86,10 @@ brews:
       email: "actions@github.com"
     test: |
       system "#{bin}/mdb version"
+    install: |
+      bin.install "mdb"
+      bash_completion.install "completions/bash/mdb" => "mdb"
+      zsh_completion.install "completions/zsh/_mdb"
 
 # Scoop (optional - uncomment if you want to publish to Scoop)
 # scoops:
