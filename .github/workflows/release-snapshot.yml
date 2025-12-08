@@ -54,8 +54,7 @@ jobs:
         with:
           distribution: goreleaser
           version: latest
-          args: release --snapshot --clean --timeout 30m
-          config: tools/mdb/.goreleaser.yaml
+          args: release --snapshot --clean --timeout 30m --config .goreleaser.yaml
           workdir: tools/mdb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

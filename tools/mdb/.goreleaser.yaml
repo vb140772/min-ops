@@ -6,18 +6,16 @@ release:
   github:
     owner: vb140772
     name: min-ops
-    # Since we're in a subdirectory, ensure we're at the repo root for git operations
-    draft: false
-    mode: replace
-  # Generate changelog from git commits
-  changelog:
-    sort: asc
-    filters:
-      exclude:
-        - "^docs:"
-        - "^test:"
-        - Merge branch
-        - Merge pull request
+
+# Generate changelog from git commits
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - Merge branch
+      - Merge pull request
 
 # Build configuration
 builds:
