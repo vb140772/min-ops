@@ -393,10 +393,24 @@ func parseFlags(ctx *cli.Context) *Config {
 	// This handles both: mdb --pager file.json and mdb file.json --pager
 	allArgs := os.Args[1:] // Skip program name
 	
-	// Find JSON file (first non-flag argument)
+	// Track which arguments are flag values (to skip when finding JSON file)
+	flagValueIndices := make(map[int]bool)
+	
+	// First pass: identify flag values
+	for i, arg := range allArgs {
+		// Check if this argument is a value for a flag that expects a value
+		if i > 0 && !strings.HasPrefix(arg, "-") {
+			prevArg := allArgs[i-1]
+			if prevArg == "--trim-domain" || prevArg == "--low-space" || prevArg == "--min-bad-disks" {
+				flagValueIndices[i] = true
+			}
+		}
+	}
+	
+	// Find JSON file (first non-flag argument that isn't a flag value)
 	var jsonFile string
-	for _, arg := range allArgs {
-		if !strings.HasPrefix(arg, "-") && arg != "" {
+	for i, arg := range allArgs {
+		if !strings.HasPrefix(arg, "-") && arg != "" && !flagValueIndices[i] {
 			jsonFile = arg
 			break
 		}
@@ -404,7 +418,8 @@ func parseFlags(ctx *cli.Context) *Config {
 	
 	// Manually parse all flags from command line
 	// This ensures flags work whether they come before or after the file
-	for _, arg := range allArgs {
+	// Handles both --flag=value and --flag value formats
+	for i, arg := range allArgs {
 		if arg == "--pager" {
 			config.PagerMode = true
 		}
@@ -417,13 +432,23 @@ func parseFlags(ctx *cli.Context) *Config {
 		if arg == "--failed" {
 			config.FailedMode = true
 		}
-		if strings.HasPrefix(arg, "--trim-domain=") {
+		
+		// Handle --trim-domain=value or --trim-domain value
+		if arg == "--trim-domain" && i+1 < len(allArgs) && !strings.HasPrefix(allArgs[i+1], "-") {
+			config.TrimDomain = allArgs[i+1]
+		} else if strings.HasPrefix(arg, "--trim-domain=") {
 			parts := strings.SplitN(arg, "=", 2)
 			if len(parts) == 2 {
 				config.TrimDomain = parts[1]
 			}
 		}
-		if strings.HasPrefix(arg, "--low-space=") {
+		
+		// Handle --low-space=value or --low-space value
+		if arg == "--low-space" && i+1 < len(allArgs) && !strings.HasPrefix(allArgs[i+1], "-") {
+			if val, err := strconv.ParseFloat(allArgs[i+1], 64); err == nil {
+				config.LowSpaceThreshold = &val
+			}
+		} else if strings.HasPrefix(arg, "--low-space=") {
 			parts := strings.SplitN(arg, "=", 2)
 			if len(parts) == 2 {
 				if val, err := strconv.ParseFloat(parts[1], 64); err == nil {
@@ -431,7 +456,13 @@ func parseFlags(ctx *cli.Context) *Config {
 				}
 			}
 		}
-		if strings.HasPrefix(arg, "--min-bad-disks=") {
+		
+		// Handle --min-bad-disks=value or --min-bad-disks value
+		if arg == "--min-bad-disks" && i+1 < len(allArgs) && !strings.HasPrefix(allArgs[i+1], "-") {
+			if val, err := strconv.Atoi(allArgs[i+1]); err == nil && val >= 0 {
+				config.MinBadDisks = &val
+			}
+		} else if strings.HasPrefix(arg, "--min-bad-disks=") {
 			parts := strings.SplitN(arg, "=", 2)
 			if len(parts) == 2 {
 				if val, err := strconv.Atoi(parts[1]); err == nil && val >= 0 {
@@ -1114,8 +1145,10 @@ func printServerInfo(pager *Pager, servers []madmin.ServerProperties, pools map[
 }
 
 func printPoolsAndSets(pager *Pager, pools map[string]map[string]interface{}, poolSetDrives map[string][]DiskInfo, allPoolSetDrives map[string][]DiskInfo, config *Config, servers []madmin.ServerProperties) {
-	// Print server information once for all pools
-	printServerInfo(pager, servers, pools, config.TrimDomain)
+	// Print server information once for all pools (skip if failed mode is enabled)
+	if !config.FailedMode {
+		printServerInfo(pager, servers, pools, config.TrimDomain)
+	}
 
 	// Collect all drives from all pools and erasure sets
 	allDrives := make([]DiskInfo, 0)
