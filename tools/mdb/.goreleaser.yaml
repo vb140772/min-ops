@@ -78,14 +78,14 @@ brews:
       bin.install "mdb"
       
       # Generate and install bash completion
-      bash_completion_dir = "#{share}/bash-completion/completions"
-      mkdir_p bash_completion_dir
-      system("#{bin}/mdb", "completion", "bash", out: "#{bash_completion_dir}/mdb")
+      bash_completion_dir = share/"bash-completion/completions"
+      bash_completion_dir.mkpath
+      system "#{bin}/mdb", "completion", "bash", :out => bash_completion_dir/"mdb"
       
       # Generate and install zsh completion
-      zsh_completion_dir = "#{share}/zsh/site-functions"
-      mkdir_p zsh_completion_dir
-      system("#{bin}/mdb", "completion", "zsh", out: "#{zsh_completion_dir}/_mdb")
+      zsh_completion_dir = share/"zsh/site-functions"
+      zsh_completion_dir.mkpath
+      system "#{bin}/mdb", "completion", "zsh", :out => zsh_completion_dir/"_mdb"
 
 # Scoop (optional - uncomment if you want to publish to Scoop)
 # scoops:
