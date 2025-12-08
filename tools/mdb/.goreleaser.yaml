@@ -55,7 +55,6 @@ archives:
     files:
       - README.md
     allow_different_binary_count: true
-    format: tar.gz
 
 # Checksums
 checksum:
