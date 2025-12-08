@@ -80,12 +80,14 @@ brews:
       # Generate and install bash completion
       bash_completion_dir = share/"bash-completion/completions"
       bash_completion_dir.mkpath
-      system "#{bin}/mdb", "completion", "bash", :out => bash_completion_dir/"mdb"
+      output = Utils.safe_popen_read("#{bin}/mdb", "completion", "bash")
+      (bash_completion_dir/"mdb").write output
       
       # Generate and install zsh completion
       zsh_completion_dir = share/"zsh/site-functions"
       zsh_completion_dir.mkpath
-      system "#{bin}/mdb", "completion", "zsh", :out => zsh_completion_dir/"_mdb"
+      output = Utils.safe_popen_read("#{bin}/mdb", "completion", "zsh")
+      (zsh_completion_dir/"_mdb").write output
 
 # Scoop (optional - uncomment if you want to publish to Scoop)
 # scoops:
