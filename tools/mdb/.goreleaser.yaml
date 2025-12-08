@@ -6,6 +6,9 @@ release:
   github:
     owner: vb140772
     name: min-ops
+    # Since we're in a subdirectory, ensure we're at the repo root for git operations
+    draft: false
+    mode: replace
   # Generate changelog from git commits
   changelog:
     sort: asc
@@ -20,6 +23,8 @@ release:
 builds:
   - id: mdb
     binary: mdb
+    main: .
+    dir: .
     goos:
       - linux
       - darwin
@@ -46,9 +51,11 @@ archives:
     format_overrides:
       - goos: windows
         format: zip
+    # Only include files that exist (paths relative to workdir)
     files:
       - README.md
-      - LICENSE
+    allow_different_binary_count: true
+    format: tar.gz
 
 # Checksums
 checksum:

@@ -24,13 +24,37 @@ jobs:
         with:
           go-version-file: tools/mdb/go.mod
 
+      - name: Verify GoReleaser config
+        working-directory: tools/mdb
+        run: |
+          echo "Checking GoReleaser config..."
+          if [ -f .goreleaser.yaml ]; then
+            echo "✓ .goreleaser.yaml exists"
+          else
+            echo "✗ .goreleaser.yaml not found"
+            exit 1
+          fi
+          if [ -f main.go ]; then
+            echo "✓ main.go exists"
+          else
+            echo "✗ main.go not found"
+            exit 1
+          fi
+          if [ -f README.md ]; then
+            echo "✓ README.md exists"
+          else
+            echo "✗ README.md not found"
+          fi
+
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v5
         with:
           distribution: goreleaser
           version: latest
-          args: release --clean
+          args: release --clean --timeout 30m
+          config: tools/mdb/.goreleaser.yaml
           workdir: tools/mdb
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: false
 
