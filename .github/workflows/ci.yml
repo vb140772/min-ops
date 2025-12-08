@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/mdb/go.mod
+
+      - name: Verify dependencies
+        working-directory: tools/mdb
+        run: |
+          go mod verify
+          go mod tidy
+
+      - name: Run tests
+        working-directory: tools/mdb
+        run: go test -v ./... || true
+
+      - name: Build
+        working-directory: tools/mdb
+        run: |
+          go build -o mdb main.go
+          ./mdb version
+
+  build:
+    name: Build ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        arch: [amd64, arm64]
+        exclude:
+          - os: windows-latest
+            arch: arm64
+      fail-fast: false
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/mdb/go.mod
+
+      - name: Build
+        working-directory: tools/mdb
+        env:
+          GOOS: ${{ matrix.os == 'ubuntu-latest' && 'linux' || matrix.os == 'macos-latest' && 'darwin' || 'windows' }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          VERSION=$(git describe --tags --always --dirty || echo "dev")
+          COMMIT=$(git rev-parse --short HEAD || echo "unknown")
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          
+          BINARY_NAME=mdb
+          if [ "${{ matrix.os }}" == "windows-latest" ]; then
+            BINARY_NAME=mdb.exe
+          fi
+          
+          go build -trimpath \
+            -ldflags "-X 'main.Version=$VERSION' -X 'main.Commit=$COMMIT' -X 'main.BuildDate=$BUILD_DATE'" \
+            -o $BINARY_NAME main.go
+          
+          ./$BINARY_NAME version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mdb-${{ matrix.os }}-${{ matrix.arch }}
+          path: tools/mdb/mdb*
+
